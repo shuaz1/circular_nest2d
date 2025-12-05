@@ -30,7 +30,8 @@ namespace nesting {
         const double sheet_height,
         const std::vector<nesting::geo::Polygon_with_holes_2>& polygons,
         const std::vector<uint32_t>& items_rotations,
-        const std::vector<uint32_t>& items_quantity);
+        const std::vector<uint32_t>& items_quantity,
+        const size_t circle_segments);
 
     void start(const size_t max_time,
         Layout& layout,

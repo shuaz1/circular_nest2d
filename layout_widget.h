@@ -39,4 +39,6 @@ private:
 	QRectF sheet;
 	QList<QPolygonF> layout;
 	qreal length{ -1 };
+	// track whether current sheet should be rendered as a circle
+	bool sheetIsCircle{ false };
 };

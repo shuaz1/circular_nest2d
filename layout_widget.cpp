@@ -3,8 +3,11 @@
 void LayoutWidget::initialize_transform() {
     globalTransform.reset();
     auto r = rect();
-    qreal scaleX = (r.width() - 5) / sheet.width();
-    qreal scaleY = (r.height() - 5) / sheet.height();
+    // guard against zero sheet size
+    qreal sheetW = sheet.width() > 0 ? sheet.width() : 1.0;
+    qreal sheetH = sheet.height() > 0 ? sheet.height() : 1.0;
+    qreal scaleX = (r.width() - 5) / sheetW;
+    qreal scaleY = (r.height() - 5) / sheetH;
     qreal scale = qMin(scaleX, scaleY);
     globalTransform.translate(r.center().rx() - sheet.center().rx() * scale,
         r.center().ry() - sheet.center().ry() * scale);
@@ -12,7 +15,14 @@ void LayoutWidget::initialize_transform() {
 }
 
 void LayoutWidget::set_sheet(qreal w, qreal h) {
-    sheet = QRectF(0, 0, w, h);
+    // 圆形板材用h==0作为标志
+    if (h == 0) {
+        sheet = QRectF(0, 0, w, w);
+        sheetIsCircle = true;
+    } else {
+        sheet = QRectF(0, 0, w, h);
+        sheetIsCircle = false;
+    }
 }
 
 void LayoutWidget::initializeGL() {
@@ -42,7 +52,12 @@ void LayoutWidget::paintEvent(QPaintEvent* event) {
     // 绘制sheet
     painter.setTransform(globalTransform);
     painter.setPen(sheetPen);
-    painter.drawRect(sheet);
+    // Only render ellipse when sheetIsCircle is explicitly set
+    if (sheetIsCircle && sheet.width() > 0 && sheet.height() > 0) {
+        painter.drawEllipse(QRectF(0, 0, sheet.width(), sheet.height()));
+    } else {
+        painter.drawRect(sheet);
+    }
 
     // 绘制多边形
     QPen polygonPen = scaledPen;  // 使用相同的线宽
@@ -57,17 +72,14 @@ void LayoutWidget::paintEvent(QPaintEvent* event) {
 }
 
 void LayoutWidget::wheelEvent(QWheelEvent* event) {
-    // 处理鼠标滚轮事件来实现缩放
-    // 获取滚轮滚动的角度
     int delta = event->angleDelta().y();
     QPointF mousePos = event->position();
     auto mapPt = globalTransform.inverted().map(mousePos);
     qreal mapX = mapPt.x();
     qreal mapY = mapPt.y();
-    // 计算缩放因子
-    qreal scaleFactor = 1.1;  // 缩放因子可以根据需要调整
-    if (event->angleDelta().y() < 0) {
-        scaleFactor = 1.0 / scaleFactor;  // 向下滚动进行缩小
+    qreal scaleFactor = 1.1;
+    if (delta < 0) {
+        scaleFactor = 1.0 / scaleFactor;
     }
     globalTransform.translate(mapX, mapY);
     globalTransform.scale(scaleFactor, scaleFactor);
@@ -77,21 +89,16 @@ void LayoutWidget::wheelEvent(QWheelEvent* event) {
 
 void LayoutWidget::mousePressEvent(QMouseEvent* event) {
     if (event->button() == Qt::LeftButton) {
-        // 记录鼠标点击位置
         m_lastPos = event->pos();
     }
 }
 
 void LayoutWidget::mouseMoveEvent(QMouseEvent* event) {
     if (event->buttons() & Qt::LeftButton) {
-        // 计算鼠标移动的距离
         QPointF delta = event->pos() - m_lastPos;
-        // 更新平移的距离
         globalTransform.translate(delta.x() / globalTransform.m11(),
             delta.y() / globalTransform.m22());
-        // 重新绘制
         update();
-        // 更新lastPos
         m_lastPos = event->pos();
     }
 }
@@ -99,14 +106,9 @@ void LayoutWidget::mouseMoveEvent(QMouseEvent* event) {
 void LayoutWidget::layoutUpdate(QTableWidgetItem* n, QTableWidgetItem* o) {
     qDebug() << "layoutUpdate START";
     if (n != nullptr) {
-        qDebug() << "n: " << n->data(Qt::DisplayRole);
-        qDebug() << "o: " << n->data(Qt::DisplayRole);
         auto i = n->tableWidget()->item(n->row(), 0);
         auto v = i->data(Qt::UserRole).value<QList<QPolygonF>>();
         auto len = i->data(Qt::DisplayRole).value<qreal>();
-        for (auto& p : v) {
-            qDebug() << p;
-        }
         this->layout = v;
         this->length = len;
         initialize_transform();

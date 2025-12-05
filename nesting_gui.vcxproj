@@ -27,9 +27,9 @@
   <PropertyGroup Label="Globals">
     <ProjectGuid>{DD27ECD0-DF83-4004-9154-8EE604C47EEC}</ProjectGuid>
     <Keyword>QtVS_v304</Keyword>
-    <WindowsTargetPlatformVersion Condition="'$(Configuration)|$(Platform)' == 'Debug|x64'">10.0.22621.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformVersion Condition="'$(Configuration)|$(Platform)' == 'Debug|x64'">10.0</WindowsTargetPlatformVersion>
     <WindowsTargetPlatformVersion Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">10.0.22621.0</WindowsTargetPlatformVersion>
-    <WindowsTargetPlatformVersion Condition="'$(Configuration)|$(Platform)' == 'Release|x64'">10.0.22621.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformVersion Condition="'$(Configuration)|$(Platform)' == 'Release|x64'">10.0</WindowsTargetPlatformVersion>
     <WindowsTargetPlatformVersion Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">10.0.22621.0</WindowsTargetPlatformVersion>
     <QtMsBuild Condition="'$(QtMsBuild)'=='' OR !Exists('$(QtMsBuild)\qt.targets')">$(MSBuildProjectDirectory)\QtMsBuild</QtMsBuild>
     <ProjectName>NestingGUI</ProjectName>
@@ -66,7 +66,7 @@
     <QtBuildConfig>debug</QtBuildConfig>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Release|x64'" Label="QtSettings">
-    <QtInstall>6.9.2_msvc2022_64</QtInstall>
+    <QtInstall>6.9.3_msvc2022_64</QtInstall>
     <QtModules>core;gui;widgets;opengl;svg;xml;charts</QtModules>
     <QtBuildConfig>release</QtBuildConfig>
   </PropertyGroup>
@@ -137,7 +137,7 @@
       <WholeProgramOptimization>false</WholeProgramOptimization>
       <OpenMPSupport>true</OpenMPSupport>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalIncludeDirectories>$(SolutionDir)CGAL-5.6.1\include;$(BOOST_INCLUDE_DIR);$(SolutionDir)libdxfrw;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>F:\boost\boost_1_84_0;F:\2DNesting\nesting2d-master\nesting2d-master\CGAL-5.6.1\include;$(SolutionDir)CGAL-5.6.1\include;$(BOOST_INCLUDE_DIR);$(SolutionDir)libdxfrw;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <TreatAngleIncludeAsExternal>true</TreatAngleIncludeAsExternal>
       <DisableAnalyzeExternal>true</DisableAnalyzeExternal>
     </ClCompile>
@@ -146,7 +146,7 @@
       <HeapCommitSize>100000000</HeapCommitSize>
       <StackReserveSize>100000000</StackReserveSize>
       <StackCommitSize>100000000</StackCommitSize>
-      <AdditionalLibraryDirectories>$(SolutionDir)CGAL-5.6.1\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>F:\boost\boost_1_84_0\lib64-msvc-14.3;F:\2DNesting\nesting2d-master\nesting2d-master\CGAL-5.6.1\lib;$(SolutionDir)CGAL-5.6.1\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>OpenGL32.Lib;libgmp-10.lib;libmpfr-4.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>

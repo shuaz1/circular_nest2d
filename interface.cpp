@@ -7,13 +7,6 @@ namespace nesting {
         std::function<void(const Solution&)> ProgressHandler,
         volatile bool* requestQuit) {
         nesting::GOMH(layout, max_time, ProgressHandler, requestQuit);
-        //// 后处理
-        // auto res = geo::postprocess(layout, part_offset / 2, left_offset,
-        //                             bottom_offset, simplified_items,
-        //                             original_items);
-        // 将res导出
-        // nesting::write_to_txt("result.svg", layout.best_utilization,
-        //                      original_sheets[0], res);
     }
     Preprocess preprocess(
         const bool need_simplify,
@@ -26,36 +19,36 @@ namespace nesting {
         const double sheet_height,
         const std::vector<nesting::geo::Polygon_with_holes_2>& polygons,
         const std::vector<uint32_t>& items_rotations,
-        const std::vector<uint32_t>& items_quantity) {
-        // 处理original_items
+        const std::vector<uint32_t>& items_quantity,
+        const size_t circle_segments) {
         std::vector<nesting::Item> original_items;
         size_t size = polygons.size();
         for (size_t i = 0; i < size; i++) {
             original_items.emplace_back(items_quantity[i], polygons[i],
                 items_rotations[i]);
         }
-        // 计算面积
         FT area(0);
         for (auto& i : original_items) {
             area += geo::pwh_area(i.poly) * FT(i.quantity);
         }
-        // 处理sheet
-        nesting::Sheet sheet(sheet_width, sheet_height);
-        std::vector<nesting::Sheet> original_sheets{ sheet };
-        // 获取副本
+        // 处理sheet：当sheet_height==0时，按圆板处理，sheet_width为直径
+        std::vector<nesting::Sheet> original_sheets;
+        if (sheet_height == 0) {
+            original_sheets.push_back(nesting::Sheet::make_circle(FT(sheet_width), circle_segments));
+        } else {
+            original_sheets.emplace_back(FT(sheet_width), FT(sheet_height));
+        }
         std::vector<nesting::Sheet> sheets;
         std::vector<nesting::Item> items;
         std::copy(original_items.begin(), original_items.end(),
             std::back_inserter(items));
         std::copy(original_sheets.begin(), original_sheets.end(),
             std::back_inserter(sheets));
-        // 前处理
         geo::preprocess(items, part_offset / 2, need_simplify);
         geo::preprocess(sheets[0], top_offset, left_offset, bottom_offset,
             right_offset);
         std::vector<nesting::Item> simplified_items;
         std::copy(items.begin(), items.end(), std::back_inserter(simplified_items));
-        // 多边形膨胀
         for (size_t i = 0; i < items.size(); i++) {
             auto& item = items[i];
             geo::offset_polygon(item.poly, part_offset / 2);
@@ -65,7 +58,6 @@ namespace nesting {
             simplified_items[i].poly =
                 geo::transform_polygon_with_holes(translate, simplified_items[i].poly);
         }
-        // 排样
         nesting::Layout layout(items, sheets, area);
         return Preprocess(layout, original_items, simplified_items);
     }

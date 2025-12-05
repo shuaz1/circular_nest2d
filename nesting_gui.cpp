@@ -11,6 +11,56 @@ nesting_gui::nesting_gui(QWidget* parent) : QMainWindow(parent) {
     ui.sheetsTable->setTargetColumn(2);
     ui.resultTable->horizontalHeader()->setSectionResizeMode(
         QHeaderView::Stretch);
+
+    // Ensure sheets table has columns for storing additional parameters and
+    // set human-readable header labels for them so numeric default headers
+    // ("4", "5") are replaced with meaningful names.
+    while (ui.sheetsTable->columnCount() < 6)
+        ui.sheetsTable->insertColumn(ui.sheetsTable->columnCount());
+    // Column 3 stores the sheet type flag
+    QTableWidgetItem* headerType = new QTableWidgetItem();
+    headerType->setText("Type");
+    ui.sheetsTable->setHorizontalHeaderItem(3, headerType);
+    // Column 4 stores segments (used for circle sheets)
+    QTableWidgetItem* headerSegments = new QTableWidgetItem();
+    headerSegments->setText("Segments");
+    ui.sheetsTable->setHorizontalHeaderItem(4, headerSegments);
+    // Column 5 stores Diameter for circle sheets
+    QTableWidgetItem* headerDiameter = new QTableWidgetItem();
+    headerDiameter->setText("Diameter");
+    ui.sheetsTable->setHorizontalHeaderItem(5, headerDiameter);
+
+    // helper to update visibility of columns for a given row based on type
+    auto updateColumnsForRow = [this](int row) {
+        if (row < 0 || row >= ui.sheetsTable->rowCount()) return;
+        int colType = 3;
+        int colPreview = 2;
+        int colLength = 0;
+        int colWidth = 1;
+        int colDiameter = 5;
+        int typeFlag = -1;
+        auto typeItem = ui.sheetsTable->item(row, colType);
+        if (typeItem) {
+            typeFlag = typeItem->data(Qt::UserRole).toInt();
+        } else {
+            auto prev = ui.sheetsTable->item(row, colPreview);
+            if (prev) typeFlag = prev->data(Qt::UserRole).toInt();
+        }
+        bool isCircle = (typeFlag == 1);
+        ui.sheetsTable->setColumnHidden(colLength, isCircle);
+        ui.sheetsTable->setColumnHidden(colWidth, isCircle);
+        ui.sheetsTable->setColumnHidden(colDiameter, !isCircle);
+    };
+
+    // If user edits the Type cell later, reflect column visibility change
+    connect(ui.sheetsTable, &QTableWidget::itemChanged, this, [this, updateColumnsForRow](QTableWidgetItem* item){
+        if (!item) return;
+        // only respond when type or preview column changes
+        if (item->column() == 3 || item->column() == 2) {
+            updateColumnsForRow(item->row());
+        }
+    });
+
     // Part2 设置QToolButton的action
     ui.partsOpenCAD->setDefaultAction(ui.actionOpen_DXF_DWG_File);
     ui.partsOpenCSV->setDefaultAction(ui.actionOpen_CSV_File);
@@ -132,24 +182,126 @@ void nesting_gui::createSheet() {
     ui.tabWidget->setCurrentIndex(1);
     QDialog dialog(this);
     UICreateSheetDialog.setupUi(&dialog);
-    UICreateSheetDialog.label_3->setVisible(false);
-    UICreateSheetDialog.quantity->setVisible(false);
+    // 默认根据类型切换可见性
+    auto typeCombo = UICreateSheetDialog.type;
+    auto labelDiameter = UICreateSheetDialog.label_diameter;
+    auto diameterSpin = UICreateSheetDialog.diameter;
+    auto labelSegments = UICreateSheetDialog.label_segments;
+    auto segmentsSpin = UICreateSheetDialog.segments;
+    auto labelLength = UICreateSheetDialog.label_length;
+    auto labelWidth = UICreateSheetDialog.label_width;
+    auto widthSpin = UICreateSheetDialog.width;
+    auto heightSpin = UICreateSheetDialog.height;
+    auto labelQuantity = UICreateSheetDialog.label_3;
+    auto quantitySpin = UICreateSheetDialog.quantity;
+    labelQuantity->setVisible(false);
+    quantitySpin->setVisible(false);
+    auto updateVisibility = [&]() {
+        bool isCircle = (typeCombo->currentIndex() == 1);
+        labelDiameter->setVisible(isCircle);
+        diameterSpin->setVisible(isCircle);
+        labelSegments->setVisible(isCircle);
+        segmentsSpin->setVisible(isCircle);
+        labelLength->setVisible(!isCircle);
+        labelWidth->setVisible(!isCircle);
+        widthSpin->setVisible(!isCircle);
+        heightSpin->setVisible(!isCircle);
+    };
+    updateVisibility();
+    connect(typeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&](int){ updateVisibility(); });
+
     if (QDialog::Accepted == dialog.exec()) {
-        auto width = UICreateSheetDialog.width->value();
-        auto height = UICreateSheetDialog.height->value();
-        auto quantity = UICreateSheetDialog.quantity->value();
         ui.sheetsTable->insertRow(rowIndex);
-        auto i1 = new QTableWidgetItem();
-        i1->setData(Qt::DisplayRole, width);
-        ui.sheetsTable->setItem(rowIndex, 0, i1);
-        auto i2 = new QTableWidgetItem();
-        i2->setData(Qt::DisplayRole, height);
-        ui.sheetsTable->setItem(rowIndex, 1, i2);
-        auto i4 = new QTableWidgetItem();
-        QPolygonF p({ QPointF(0, 0), QPointF(width, 0), QPointF(width, height),
-                     QPointF(0, height) });
-        i4->setData(Qt::DisplayRole, p);
-        ui.sheetsTable->setItem(rowIndex, 2, i4);
+        // Add hidden columns to store shape type, segments and diameter
+        while (ui.sheetsTable->columnCount() < 6) ui.sheetsTable->insertColumn(ui.sheetsTable->columnCount());
+        int colType = 3;
+        int colSegments = 4;
+        int colW = 0;
+        int colH = 1;
+        int colPreview = 2;
+        int colDiameter = 5;
+        QPolygonF p;
+        double w = 0, h = 0;
+        int typeFlag = typeCombo->currentIndex();
+        if (typeFlag == 1) {
+            // Circle
+            double d = diameterSpin->value();
+            // store diameter in dedicated column, leave length/width blank
+            auto iDia = new QTableWidgetItem(); iDia->setData(Qt::DisplayRole, d);
+            ui.sheetsTable->setItem(rowIndex, colDiameter, iDia);
+            // keep length/width cells empty for clarity
+            ui.sheetsTable->setItem(rowIndex, colW, new QTableWidgetItem());
+            ui.sheetsTable->setItem(rowIndex, colH, new QTableWidgetItem());
+
+            const int segs = UICreateSheetDialog.segments->value();
+            constexpr double kPi = 3.14159265358979323846;
+            for (int i = 0; i < segs; ++i) {
+                double theta = (2.0 * kPi * i) / segs;
+                double x = (d / 2.0) + (d / 2.0) * std::cos(theta);
+                double y = (d / 2.0) + (d / 2.0) * std::sin(theta);
+                p.append(QPointF(x, y));
+            }
+            auto i4 = new QTableWidgetItem();
+            i4->setData(Qt::DisplayRole, p);
+            i4->setData(Qt::UserRole, typeFlag);
+            ui.sheetsTable->setItem(rowIndex, colPreview, i4);
+            auto iType = new QTableWidgetItem();
+            // display human-readable type instead of numeric
+            iType->setData(Qt::DisplayRole, QString("Circle"));
+            iType->setData(Qt::UserRole, typeFlag);
+            ui.sheetsTable->setItem(rowIndex, colType, iType);
+            // store segments value
+            auto segItem = new QTableWidgetItem();
+            segItem->setData(Qt::DisplayRole, UICreateSheetDialog.segments->value());
+            ui.sheetsTable->setItem(rowIndex, colSegments, segItem);
+        } else {
+            // Rectangle
+            w = widthSpin->value();
+            h = heightSpin->value();
+            auto i1 = new QTableWidgetItem(); i1->setData(Qt::DisplayRole, w);
+            ui.sheetsTable->setItem(rowIndex, colW, i1);
+            auto i2 = new QTableWidgetItem(); i2->setData(Qt::DisplayRole, h);
+            ui.sheetsTable->setItem(rowIndex, colH, i2);
+            p = QPolygonF({ QPointF(0, 0), QPointF(w, 0), QPointF(w, h), QPointF(0, h) });
+            auto i4 = new QTableWidgetItem();
+            i4->setData(Qt::DisplayRole, p);
+            i4->setData(Qt::UserRole, typeFlag);
+            ui.sheetsTable->setItem(rowIndex, colPreview, i4);
+            auto iType = new QTableWidgetItem();
+            // display human-readable type instead of numeric
+            iType->setData(Qt::DisplayRole, QString("Rectangle"));
+            iType->setData(Qt::UserRole, typeFlag);
+            ui.sheetsTable->setItem(rowIndex, colType, iType);
+            // for rectangle, set segments and diameter to 0/blank
+            auto segItem = new QTableWidgetItem();
+            segItem->setData(Qt::DisplayRole, 0);
+            ui.sheetsTable->setItem(rowIndex, colSegments, segItem);
+            ui.sheetsTable->setItem(rowIndex, colDiameter, new QTableWidgetItem());
+        }
+        // ensure columns visibility reflects stored type
+        // reuse lambda defined in constructor scope
+        // find lambda by creating a small local copy
+        auto updateColumnsForRowLocal = [this](int row) {
+            if (row < 0 || row >= ui.sheetsTable->rowCount()) return;
+            int colType = 3;
+            int colPreview = 2;
+            int colLength = 0;
+            int colWidth = 1;
+            int colDiameter = 5;
+            int typeFlag = -1;
+            auto typeItem = ui.sheetsTable->item(row, colType);
+            if (typeItem) {
+                typeFlag = typeItem->data(Qt::UserRole).toInt();
+            } else {
+                auto prev = ui.sheetsTable->item(row, colPreview);
+                if (prev) typeFlag = prev->data(Qt::UserRole).toInt();
+            }
+            bool isCircle = (typeFlag == 1);
+            ui.sheetsTable->setColumnHidden(colLength, isCircle);
+            ui.sheetsTable->setColumnHidden(colWidth, isCircle);
+            ui.sheetsTable->setColumnHidden(colDiameter, !isCircle);
+        };
+        updateColumnsForRowLocal(rowIndex);
     }
 }
 
@@ -228,10 +380,22 @@ void nesting_gui::toTXT() {
         auto util = i2->data(Qt::DisplayRole).value<double>();
         auto pgns = i2->data(Qt::UserRole)
             .value<std::vector<nesting::geo::Polygon_with_holes_2>>();
-        auto sheet_length =
-            ui.sheetsTable->item(0, 0)->data(Qt::DisplayRole).value<double>();
-        auto sheet_width =
-            ui.sheetsTable->item(0, 1)->data(Qt::DisplayRole).value<double>();
+        // read sheet dimensions depending on type
+        double sheet_length = 0;
+        double sheet_width = 0;
+        auto prev = ui.sheetsTable->item(0, 2);
+        int typeFlag = prev ? prev->data(Qt::UserRole).toInt() : 0;
+        if (typeFlag == 1) {
+            // circle: diameter stored in column 5
+            auto diaItem = ui.sheetsTable->item(0, 5);
+            if (diaItem) sheet_width = diaItem->data(Qt::DisplayRole).value<double>();
+            sheet_length = 0;
+        } else {
+            auto lenIt = ui.sheetsTable->item(0, 0);
+            auto widIt = ui.sheetsTable->item(0, 1);
+            if (lenIt) sheet_length = lenIt->data(Qt::DisplayRole).value<double>();
+            if (widIt) sheet_width = widIt->data(Qt::DisplayRole).value<double>();
+        }
         auto ret = nesting::write_to_txt(filePath.toStdString(), util, sheet_width,
             sheet_length, pgns);
         if (ret) {
@@ -257,10 +421,20 @@ void nesting_gui::toDXF() {
         auto util = i2->data(Qt::DisplayRole).value<double>();
         auto pgns = i2->data(Qt::UserRole)
             .value<std::vector<nesting::geo::Polygon_with_holes_2>>();
-        auto sheet_length =
-            ui.sheetsTable->item(0, 0)->data(Qt::DisplayRole).value<double>();
-        auto sheet_width =
-            ui.sheetsTable->item(0, 1)->data(Qt::DisplayRole).value<double>();
+        double sheet_length = 0;
+        double sheet_width = 0;
+        auto prev = ui.sheetsTable->item(0, 2);
+        int typeFlag = prev ? prev->data(Qt::UserRole).toInt() : 0;
+        if (typeFlag == 1) {
+            auto diaItem = ui.sheetsTable->item(0, 5);
+            if (diaItem) sheet_width = diaItem->data(Qt::DisplayRole).value<double>();
+            sheet_length = 0;
+        } else {
+            auto lenIt = ui.sheetsTable->item(0, 0);
+            auto widIt = ui.sheetsTable->item(0, 1);
+            if (lenIt) sheet_length = lenIt->data(Qt::DisplayRole).value<double>();
+            if (widIt) sheet_width = widIt->data(Qt::DisplayRole).value<double>();
+        }
         auto ret = nesting::write_to_dxf(filePath.toStdString(), util, sheet_width,
             sheet_length, pgns);
         if (ret) {
@@ -286,10 +460,20 @@ void nesting_gui::toSVG() {
         auto util = i2->data(Qt::DisplayRole).value<double>();
         auto pgns = i2->data(Qt::UserRole)
             .value<std::vector<nesting::geo::Polygon_with_holes_2>>();
-        auto sheet_length =
-            ui.sheetsTable->item(0, 0)->data(Qt::DisplayRole).value<double>();
-        auto sheet_width =
-            ui.sheetsTable->item(0, 1)->data(Qt::DisplayRole).value<double>();
+        double sheet_length = 0;
+        double sheet_width = 0;
+        auto prev = ui.sheetsTable->item(0, 2);
+        int typeFlag = prev ? prev->data(Qt::UserRole).toInt() : 0;
+        if (typeFlag == 1) {
+            auto diaItem = ui.sheetsTable->item(0, 5);
+            if (diaItem) sheet_width = diaItem->data(Qt::DisplayRole).value<double>();
+            sheet_length = 0;
+        } else {
+            auto lenIt = ui.sheetsTable->item(0, 0);
+            auto widIt = ui.sheetsTable->item(0, 1);
+            if (lenIt) sheet_length = lenIt->data(Qt::DisplayRole).value<double>();
+            if (widIt) sheet_width = widIt->data(Qt::DisplayRole).value<double>();
+        }
         auto ret = nesting::write_to_svg(filePath.toStdString(), util, sheet_width,
             sheet_length, pgns);
         if (ret) {
@@ -338,9 +522,22 @@ void nesting_gui::start() {
     // 获取sheet
     QTableWidgetItem* i0 = ui.sheetsTable->item(0, 0);
     QTableWidgetItem* i1 = ui.sheetsTable->item(0, 1);
-    double sheet_width = i0->data(Qt::DisplayRole).value<double>();
-    double sheet_height = i1->data(Qt::DisplayRole).value<double>();
-    ui.openGLWidget->set_sheet(sheet_width, sheet_height);
+    QTableWidgetItem* iPreview = ui.sheetsTable->item(0, 2);
+    double sheet_width = 0;
+    double sheet_height = 0;
+    int typeFlag = iPreview ? iPreview->data(Qt::UserRole).value<int>() : 0;
+    if (typeFlag == 1) {
+        // Circle: diameter stored in column 5
+        auto diaItem = ui.sheetsTable->item(0, 5);
+        if (diaItem) sheet_width = diaItem->data(Qt::DisplayRole).value<double>();
+        sheet_height = 0;
+        // set GL widget accordingly
+        ui.openGLWidget->set_sheet(sheet_width, 0);
+    } else {
+        if (i0) sheet_width = i0->data(Qt::DisplayRole).value<double>();
+        if (i1) sheet_height = i1->data(Qt::DisplayRole).value<double>();
+        ui.openGLWidget->set_sheet(sheet_width, sheet_height);
+    }
     // 时间参数
     int seconds = 24 * 3600;
     if (ui.fixRun->isChecked()) {
@@ -361,6 +558,14 @@ void nesting_gui::start() {
     auto bottom_offset = ui.BottomSpinBox->value();
     auto left_offset = ui.LeftSpinBox->value();
     auto right_offset = ui.RightSpinBox->value();
+    // Read segments value only if sheet is circle
+    int segments = 128;
+    if (typeFlag == 1) {
+        if (ui.sheetsTable->columnCount() > 4) {
+            auto segItem = ui.sheetsTable->item(0, 4);
+            if (segItem) segments = segItem->data(Qt::DisplayRole).toInt();
+        }
+    }
     // ui更新
     ui.ChartScrollBar->setRange(0, 30);
     ui.ChartScrollBar->setValue(0);
@@ -380,7 +585,7 @@ void nesting_gui::start() {
     timer->start(1000);
     startWork(need_simplify, top_offset, left_offset, bottom_offset, right_offset,
         part_offset, sheet_width, sheet_height, seconds, polygons,
-        allowed_rotations, quantity);
+        allowed_rotations, quantity, segments);
 }
 
 void nesting_gui::stop() {
@@ -462,7 +667,8 @@ void nesting_gui::startWork(
     const size_t max_time,
     const std::vector<nesting::geo::Polygon_with_holes_2>& polygons,
     const std::vector<uint32_t>& items_rotations,
-    const std::vector<uint32_t>& items_quantity) {
+    const std::vector<uint32_t>& items_quantity,
+    const int circle_segments) {
     // Part6 设置线程
     qDebug() << "start work START";
     worker = new Worker(this);
@@ -471,7 +677,7 @@ void nesting_gui::startWork(
     connect(worker, &Worker::sendMessage, this, &nesting_gui::handleMessage);
     worker->set(need_simplify, top_offset, left_offset, bottom_offset,
         right_offset, part_offset, sheet_width, sheet_height, max_time,
-        polygons, items_rotations, items_quantity);
+        polygons, items_rotations, items_quantity, circle_segments);
     worker->start();
     qDebug() << "start work END";
 }
