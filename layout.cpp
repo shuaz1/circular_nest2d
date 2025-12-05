@@ -47,8 +47,13 @@ namespace nesting {
         std::clog << "total_area: " << area << std::endl;
         std::clog << sheets[0].height << std::endl;
         FT min_length(max_x_span);
-        lower_length = std::max(area / sheets[0].height, min_length);
-        //lower_length = area / sheets[0].height;
+        // 核心思想：条带沿x方向扩展，lower_length为面积/高度的下界
+        FT effective_height = sheets[0].height;
+        if (effective_height == FT(0)) {
+            // 圆板：用直径作为高度近似，保持条带算法不变
+            effective_height = sheets[0].diameter;
+        }
+        lower_length = std::max(area / effective_height, min_length);
     }
     Polygon_with_holes_2* Layout::get_canonical_polygon(
         const Polygon_with_holes_2& poly) {

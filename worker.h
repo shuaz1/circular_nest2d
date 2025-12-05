@@ -45,6 +45,24 @@ public:
         items_rotations = _items_rotations;
         items_quantity = _items_quantity;
     }
+    void set(const bool _need_simplify,
+        const double _top_offset,
+        const double _left_offset,
+        const double _bottom_offset,
+        const double _right_offset,
+        const double _part_offset,
+        const double _sheet_width,
+        const double _sheet_height,
+        const size_t _max_time,
+        const std::vector<nesting::geo::Polygon_with_holes_2>& _polygons,
+        const std::vector<uint32_t>& _items_rotations,
+        const std::vector<uint32_t>& _items_quantity,
+        const int _circle_segments) {
+        set(_need_simplify, _top_offset, _left_offset, _bottom_offset, _right_offset,
+            _part_offset, _sheet_width, _sheet_height, _max_time,
+            _polygons, _items_rotations, _items_quantity);
+        circle_segments = _circle_segments;
+    }
     void run() override {
         // 在这里执行耗时的操作
         qDebug() << "CustomThread is running in thread:"
@@ -73,6 +91,7 @@ private:
     std::vector<nesting::geo::Polygon_with_holes_2> polygons;
     std::vector<uint32_t> items_rotations;
     std::vector<uint32_t> items_quantity;
+    int circle_segments{ 128 };
     std::function<void(const Solution&)> h =
         std::bind(&Worker::hook, this, std::placeholders::_1);
     nesting::Preprocess* p{ nullptr };
@@ -86,7 +105,7 @@ private:
             p = new nesting::Preprocess(nesting::preprocess(
                 need_simplify, top_offset, left_offset, bottom_offset, right_offset,
                 part_offset, sheet_width, sheet_height, polygons, items_rotations,
-                items_quantity));
+                items_quantity, circle_segments));
         }
         catch (const std::runtime_error& e) {
             emit sendMessage(e.what());

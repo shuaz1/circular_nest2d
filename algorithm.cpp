@@ -199,27 +199,48 @@ namespace nesting {
                 return Polygon_2();
             }
 
-            Polygon_2 outer_boundary;
+            // 粗略IFR矩形
+            Polygon_2 rect_boundary;
             auto x1 = bbox_A.xmin() - bbox_B.xmin();
             auto x2 = bbox_A.xmax() - bbox_B.xmax();
             auto y1 = bbox_A.ymin() - bbox_B.ymin();
             auto y2 = bbox_A.ymax() - bbox_B.ymax();
-            // 去除重复的点，IFR可能退化成线或点
             if (x1 == x2) {
-                outer_boundary.push_back(Point_2(x1, y1));
+                rect_boundary.push_back(Point_2(x1, y1));
                 if (y1 != y2) {
-                    outer_boundary.push_back(Point_2(x1, y2));
+                    rect_boundary.push_back(Point_2(x1, y2));
                 }
             }
             else {
-                outer_boundary.push_back(Point_2(x1, y1));
-                outer_boundary.push_back(Point_2(x2, y1));
+                rect_boundary.push_back(Point_2(x1, y1));
+                rect_boundary.push_back(Point_2(x2, y1));
                 if (y1 != y2) {
-                    outer_boundary.push_back(Point_2(x2, y2));
-                    outer_boundary.push_back(Point_2(x1, y2));
+                    rect_boundary.push_back(Point_2(x2, y2));
+                    rect_boundary.push_back(Point_2(x1, y2));
                 }
             }
-            return outer_boundary;
+
+            // 安全边距：将板材外边界轻微内缩，避免数值误差导致越界
+            Polygon_with_holes_2 clipped_sheet = poly_A;
+            try {
+                double span = std::max(CGAL::to_double(bbox_A.x_span()), CGAL::to_double(bbox_A.y_span()));
+                double epsilon = std::max(1e-6, span * 1e-8); // 根据尺寸设置极小内缩
+                offset_polygon(clipped_sheet, -epsilon);
+            }
+            catch (...) {
+                // 偶发失败时，回退为原板材
+                clipped_sheet = poly_A;
+            }
+
+            // 将IFR矩形裁剪到真实的板材多边形内部，避免圆形板材时落到外接矩形区域
+            std::vector<Polygon_with_holes_2> clipped;
+            CGAL::intersection(clipped_sheet.outer_boundary(), rect_boundary, std::back_inserter(clipped));
+            if (!clipped.empty()) {
+                // 取第一个区域的外边界作为IFR
+                return clipped[0].outer_boundary();
+            }
+            // 若相交为空，返回空IFR
+            return Polygon_2();
         }
 
         void offset_polygon(Polygon_with_holes_2& p, double offset) {
