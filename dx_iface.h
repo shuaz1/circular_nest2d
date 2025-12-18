@@ -165,6 +165,11 @@ public:
     dxfRW* dxfW{ nullptr };  // pointer to writer, needed to send data
     nesting::geo::Polygon_with_holes_2* pwh{ nullptr };
     std::vector<nesting::geo::Polygon_with_holes_2>* solutions{ nullptr };
+    
+    // 板材信息（用于导出时绘制板材边界）
+    bool is_circle_sheet{ false };  // 是否为圆形板材
+    double sheet_width{ 0.0 };     // 板材宽度（矩形）或直径（圆形）
+    double sheet_length{ 0.0 };    // 板材长度（矩形，圆形时为0）
 };
 
 #endif  // DX_IFACE_H

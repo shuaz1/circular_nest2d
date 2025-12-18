@@ -106,7 +106,13 @@
     <ClCompile Include="candidate_points.cpp">
       <Filter>Source Files\engine</Filter>
     </ClCompile>
+    <ClCompile Include="circle_nesting.cpp">
+      <Filter>Source Files\engine</Filter>
+    </ClCompile>
     <ClCompile Include="layout.cpp">
+      <Filter>Source Files\engine</Filter>
+    </ClCompile>
+    <ClCompile Include="genetic_algorithm.cpp">
       <Filter>Source Files\engine</Filter>
     </ClCompile>
     <ClCompile Include="nesting.cpp">
@@ -205,6 +211,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="candidate_points.h">
+      <Filter>Header Files\engine</Filter>
+    </ClInclude>
+    <ClInclude Include="circle_nesting.h">
       <Filter>Header Files\engine</Filter>
     </ClInclude>
     <ClInclude Include="nesting.h">

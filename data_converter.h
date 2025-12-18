@@ -41,6 +41,7 @@ namespace nesting {
         const double& best_utilization,
         const double& sheet_width,
         const double& sheet_length,
-        const std::vector<geo::Polygon_with_holes_2>& res);
+        const std::vector<geo::Polygon_with_holes_2>& res,
+        bool is_circle = false);
 
 }  // namespace nesting

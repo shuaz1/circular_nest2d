@@ -111,7 +111,8 @@ private:
             emit sendMessage(e.what());
         }
         try {
-            nesting::start(max_time, p->layout, h, &isRequestQuit);
+            // 使用独立 GA 模式进行全局优化（内部会调用 minimize_overlap 做局部精修）
+            nesting::start_ga(p->layout, h, &isRequestQuit);
         }
         catch (const std::runtime_error& e) {
             emit sendMessage(e.what());

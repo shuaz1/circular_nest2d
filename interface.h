@@ -33,8 +33,14 @@ namespace nesting {
         const std::vector<uint32_t>& items_quantity,
         const size_t circle_segments);
 
+    // 圆形板材高利用率排样入口
     void start(const size_t max_time,
         Layout& layout,
+        std::function<void(const Solution&)> ProgressHandler,
+        volatile bool* requestQuit);
+
+    // 圆形板材高利用率排样算法（目标92%+利用率）
+    void start_ga(Layout& layout,
         std::function<void(const Solution&)> ProgressHandler,
         volatile bool* requestQuit);
 }  // namespace nesting

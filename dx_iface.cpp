@@ -209,10 +209,30 @@ void dx_iface::writeHeader(DRW_Header& data) {
 }
 
 void dx_iface::writeEntities() {
-    // for (std::list<DRW_Entity*>::const_iterator it =
-    // cData->mBlock->ent.begin();
-    //      it != cData->mBlock->ent.end(); ++it)
-    //   writeEntity(*it);
+    // 先写入板材边界（圆形或矩形）
+    if (is_circle_sheet && sheet_width > 0) {
+        // 圆形板材：绘制圆形
+        DRW_Circle circle;
+        double radius = sheet_width / 2.0;
+        circle.basePoint.x = radius;  // 圆心X坐标
+        circle.basePoint.y = radius;  // 圆心Y坐标
+        circle.basePoint.z = 0.0;
+        circle.radious = radius;     // 半径
+        circle.layer = "0";           // 图层
+        writeEntity(&circle);
+    } else if (!is_circle_sheet && sheet_width > 0 && sheet_length > 0) {
+        // 矩形板材：绘制矩形（使用LWPolyline）
+        DRW_LWPolyline rect;
+        rect.flags = 1;  // 闭合
+        rect.addVertex(DRW_Vertex2D(0.0, 0.0, 0));
+        rect.addVertex(DRW_Vertex2D(sheet_length, 0.0, 0));
+        rect.addVertex(DRW_Vertex2D(sheet_length, sheet_width, 0));
+        rect.addVertex(DRW_Vertex2D(0.0, sheet_width, 0));
+        rect.layer = "0";  // 图层
+        writeEntity(&rect);
+    }
+    
+    // 然后写入所有零件
     for (auto& p : *solutions) {
         auto& outer = p.outer_boundary();
         DRW_LWPolyline pwl;

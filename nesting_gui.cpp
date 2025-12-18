@@ -1,4 +1,6 @@
 ﻿#include "nesting_gui.h"
+#include "sheet.h"
+#include "algorithm.h"
 
 nesting_gui::nesting_gui(QWidget* parent) : QMainWindow(parent) {
     ui.setupUi(this);
@@ -436,7 +438,7 @@ void nesting_gui::toDXF() {
             if (widIt) sheet_width = widIt->data(Qt::DisplayRole).value<double>();
         }
         auto ret = nesting::write_to_dxf(filePath.toStdString(), util, sheet_width,
-            sheet_length, pgns);
+            sheet_length, pgns, (typeFlag == 1));
         if (ret) {
             QMessageBox::information(this, "Success", "File saved successfully");
         }
@@ -620,8 +622,6 @@ void nesting_gui::handleProgress(Solution solu,
     ui.resultTable->insertRow(0);
 
     auto i2 = new QTableWidgetItem();
-    i2->setData(Qt::DisplayRole, solu.utilization);
-    ui.resultTable->setItem(0, 1, i2);
     auto i3 = new QTableWidgetItem();
     i3->setData(Qt::DisplayRole, solu.time);
     ui.resultTable->setItem(0, 2, i3);
@@ -630,6 +630,53 @@ void nesting_gui::handleProgress(Solution solu,
     auto left_offset = ui.LeftSpinBox->value();
     auto i1 = new QTableWidgetItem();
     auto pgns = nesting::postprocess(solu.solution, part_offset, left_offset, bottom_offset, sim, ori);
+
+    // 使用“当前已经排布在圆内的刀头”面积来计算利用率：
+    // 每次回调，根据当前解中在圆内的刀头面积 / 圆面积，得到一个时序利用率，连成曲线。
+    double diameter = solu.length;
+    double radius = diameter / 2.0;
+    double cx = radius;
+    double cy = radius;
+    double radius_sq = radius * radius;
+
+    double parts_area = 0.0;
+    for (const auto& pwh : pgns) {
+        // 先判断该刀头是否在圆内（或至少有顶点在圆内），过滤掉还没排进来的刀头
+        bool in_circle = false;
+        const auto& outer = pwh.outer_boundary();
+        for (auto v = outer.vertices_begin(); v != outer.vertices_end(); ++v) {
+            double x = CGAL::to_double(v->x());
+            double y = CGAL::to_double(v->y());
+            double dx = x - cx;
+            double dy = y - cy;
+            double dist_sq = dx * dx + dy * dy;
+            if (dist_sq <= radius_sq + 1e-6) {
+                in_circle = true;
+                break;
+            }
+        }
+        if (!in_circle) {
+            continue;
+        }
+
+        try {
+            parts_area += CGAL::to_double(nesting::geo::pwh_area(pwh));
+        } catch (...) {
+            // 忽略单个多边形的面积计算错误
+        }
+    }
+
+    // 圆面积：使用 solu.length 作为直径，和核心算法 / DXF 完全一致
+    double circle_area = nesting::Sheet::kPi * radius * radius;
+    double util = 0.0;
+    if (circle_area > 0.0) {
+        util = parts_area / circle_area;
+        if (util < 0.0) util = 0.0;
+        if (util > 1.0) util = 1.0;
+    }
+
+    i2->setData(Qt::DisplayRole, util);
+    ui.resultTable->setItem(0, 1, i2);
     QVariant var1;
     var1.setValue(pgns);
     i2->setData(Qt::UserRole, var1);
@@ -651,7 +698,7 @@ void nesting_gui::handleProgress(Solution solu,
     ui.resultTable->setItem(0, 0, i1);
     ui.resultTable->setCurrentCell(0, 0);
     // Part2 更新result chart
-    series->append(solu.time, solu.utilization);
+    series->append(solu.time, util);
     qDebug() << "handleProgress END";
 }
 

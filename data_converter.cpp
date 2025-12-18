@@ -142,9 +142,13 @@ namespace nesting {
         const double& best_utilization,
         const double& sheet_width,
         const double& sheet_length,
-        const std::vector<geo::Polygon_with_holes_2>& res) {
+        const std::vector<geo::Polygon_with_holes_2>& res,
+        bool is_circle) {
         dx_iface iface;
         iface.solutions = const_cast<std::vector<geo::Polygon_with_holes_2>*>(&res);
+        iface.is_circle_sheet = is_circle;
+        iface.sheet_width = sheet_width;
+        iface.sheet_length = sheet_length;
         return iface.fileExport(path, DRW::Version::AC1014, false, false);
     }
 

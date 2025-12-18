@@ -1,5 +1,7 @@
 ﻿#include <QtWidgets/QApplication>
+#include <QSurfaceFormat>
 #include "nesting_gui.h"
+
 int main(int argc, char* argv[]) {
   // 设置 OpenGL 版本
   QSurfaceFormat format;
