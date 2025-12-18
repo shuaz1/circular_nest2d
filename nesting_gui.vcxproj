@@ -216,7 +216,6 @@
     <ClCompile Include="data_converter.cpp" />
     <ClCompile Include="dx_iface.cpp" />
     <ClCompile Include="layout.cpp" />
-    <ClCompile Include="genetic_algorithm.cpp" />
     <ClCompile Include="interface.cpp" />
     <ClCompile Include="layout_widget.cpp" />
     <ClCompile Include="libdxfrw\drw_base.cpp" />

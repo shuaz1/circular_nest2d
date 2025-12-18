@@ -112,9 +112,6 @@
     <ClCompile Include="layout.cpp">
       <Filter>Source Files\engine</Filter>
     </ClCompile>
-    <ClCompile Include="genetic_algorithm.cpp">
-      <Filter>Source Files\engine</Filter>
-    </ClCompile>
     <ClCompile Include="nesting.cpp">
       <Filter>Source Files\engine</Filter>
     </ClCompile>

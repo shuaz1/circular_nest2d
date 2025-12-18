@@ -199,7 +199,8 @@ void nesting_gui::createSheet() {
     labelQuantity->setVisible(false);
     quantitySpin->setVisible(false);
     auto updateVisibility = [&]() {
-        bool isCircle = (typeCombo->currentIndex() == 1);
+        // 只支持圆形板材：强制使用 Circle 类型
+        bool isCircle = true;
         labelDiameter->setVisible(isCircle);
         diameterSpin->setVisible(isCircle);
         labelSegments->setVisible(isCircle);
@@ -209,6 +210,9 @@ void nesting_gui::createSheet() {
         widthSpin->setVisible(!isCircle);
         heightSpin->setVisible(!isCircle);
     };
+    // 强制为圆形，并禁用类型选择（彻底移除矩形选项）
+    typeCombo->setCurrentIndex(1);
+    typeCombo->setDisabled(true);
     updateVisibility();
     connect(typeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), [&](int){ updateVisibility(); });
 

@@ -596,8 +596,23 @@ bool CircleNesting::try_place_all_parts(double diameter, volatile bool* requestQ
         }
 
         size_t shape_idx = indices[i];
-        // place_shape_with_nfp 内部已经会尝试所有旋转角度
-        if (place_shape_with_nfp(shape_idx, placed_indices, params_.try_all_rotations)) {
+        bool placed = false;
+
+        // 优化策略：即使允许旋转，也优先尝试“保持当前朝向”放置；
+        // 只有在固定朝向无法放置时，才启用多角度旋转搜索。
+        if (params_.try_all_rotations) {
+            // 1）先不旋转（只用当前rotation）尝试放置
+            placed = place_shape_with_nfp(shape_idx, placed_indices, /*try_all_rotations=*/false);
+            // 2）如果失败，再启用多角度旋转搜索
+            if (!placed) {
+                placed = place_shape_with_nfp(shape_idx, placed_indices, /*try_all_rotations=*/true);
+            }
+        } else {
+            // 完全不旋转的模式，保持原有行为
+            placed = place_shape_with_nfp(shape_idx, placed_indices, /*try_all_rotations=*/false);
+        }
+
+        if (placed) {
             // 成功放置，添加到已放置列表
             placed_indices.push_back(shape_idx);
         }
