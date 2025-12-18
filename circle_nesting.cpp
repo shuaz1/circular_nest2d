@@ -699,6 +699,60 @@ void CircleNesting::compact_layout(size_t iterations, volatile bool* requestQuit
         for (size_t idx : indices) {
             auto& shape = layout_.sheet_parts[0][idx];
             
+            // ============================================================
+            // 额外一步：使用 NFP 进行局部“贴合重定位”（图形匹配式局部优化）
+            // 偶尔将当前零件从当前位置拿起，重新通过 NFP 候选点寻找更紧凑的位置，
+            // 相当于对该零件做一次“局部重新排布”。
+            // ============================================================
+            if (params_.prioritize_compact_positions) {
+                // 以一定概率或频率触发（避免过慢）：这里简单用迭代步长控制
+                if (iter % 20 == 0) {
+                    // 构造“其他零件”集合
+                    std::vector<size_t> other_indices;
+                    other_indices.reserve(layout_.poly_num - 1);
+                    for (size_t j = 0; j < layout_.poly_num; ++j) {
+                        if (j != idx) other_indices.push_back(j);
+                    }
+
+                    auto old_x = shape.get_translate_ft_x();
+                    auto old_y = shape.get_translate_ft_y();
+                    uint32_t old_rot = shape.get_rotation();
+
+                    // 使用现有 NFP 放置逻辑，对该零件做一次局部重定位
+                    bool placed_better = place_shape_with_nfp(idx, other_indices, params_.try_all_rotations);
+                    if (placed_better && is_valid_placement(idx, other_indices)) {
+                        double new_util = calculate_utilization();
+                        double delta = new_util - current_utilization;
+                        bool accept = false;
+                        if (delta > 0) {
+                            accept = true;
+                            improved = true;
+                            current_utilization = new_util;
+                            if (new_util > best_utilization_this_compact) {
+                                best_utilization_this_compact = new_util;
+                            }
+                        } else if (params_.use_simulated_annealing && temperature > 0) {
+                            double prob = std::exp(delta / temperature);
+                            if (dis(gen) < prob) {
+                                accept = true;
+                            }
+                        }
+
+                        if (!accept) {
+                            // 恢复原位与旋转
+                            shape.set_rotation(old_rot);
+                            shape.set_translate(old_x, old_y);
+                            shape.update();
+                        }
+                    } else {
+                        // 重定位失败则恢复
+                        shape.set_rotation(old_rot);
+                        shape.set_translate(old_x, old_y);
+                        shape.update();
+                    }
+                }
+            }
+
             // 多方向搜索：向中心、向最近零件、随机方向
             std::vector<std::pair<double, double>> directions;
             
@@ -1235,6 +1289,136 @@ std::vector<size_t> CircleNesting::smart_order_parts() const {
     return indices;
 }
 
+// ============================================================================
+// 调度算法：尝试多种放置顺序，返回能放置最多零件且利用率最高的顺序
+// ============================================================================
+std::vector<size_t> CircleNesting::schedule_best_order(double diameter, volatile bool* requestQuit,
+                                                        std::function<void(const Layout&)>* progress_callback) {
+    if (!params_.use_scheduling || params_.scheduling_attempts <= 1) {
+        return smart_order_parts();
+    }
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+
+    std::vector<size_t> best_order = smart_order_parts();
+    size_t best_placed_count = 0;
+    double best_util = 0.0;
+    
+    // 内存优化：只在找到更好结果时才保存布局
+    bool has_best_layout = false;
+    std::vector<std::vector<TransformedShape>> best_layout;
+
+    // 内存优化：使用 move 语义备份，减少拷贝
+    auto original_parts = std::move(layout_.sheet_parts);
+    layout_.sheet_parts = original_parts; // 恢复一份用于操作
+
+    // 内存优化：预分配 candidate_order
+    std::vector<size_t> candidate_order;
+    candidate_order.reserve(layout_.poly_num);
+    
+    // 内存优化：预分配 placed_indices
+    std::vector<size_t> placed_indices;
+    placed_indices.reserve(layout_.poly_num);
+    
+    // 内存优化：复用空列表
+    const std::vector<size_t> empty_placed;
+
+    for (size_t attempt = 0; attempt < params_.scheduling_attempts; ++attempt) {
+        if (requestQuit && *requestQuit) break;
+
+        // 生成候选顺序（复用 candidate_order）
+        candidate_order.clear();
+        if (attempt == 0) {
+            candidate_order = smart_order_parts();
+        } else if (attempt == 1) {
+            candidate_order.resize(layout_.poly_num);
+            std::iota(candidate_order.begin(), candidate_order.end(), 0);
+            std::sort(candidate_order.begin(), candidate_order.end(), [&](size_t i, size_t j) {
+                try {
+                    double area_i = safe_to_double(geo::pwh_area(*original_parts[0][i].base));
+                    double area_j = safe_to_double(geo::pwh_area(*original_parts[0][j].base));
+                    return area_i > area_j;
+                } catch (...) {
+                    return false;
+                }
+            });
+        } else if (params_.use_random_shuffle) {
+            candidate_order = smart_order_parts();
+            std::shuffle(candidate_order.begin(), candidate_order.end(), gen);
+        } else {
+            continue;
+        }
+
+        // 恢复初始状态
+        layout_.sheet_parts = original_parts;
+        update_circle_diameter(diameter);
+
+        // 复用 placed_indices
+        placed_indices.clear();
+        double radius = diameter / 2.0;
+
+        // 放置第一个零件
+        if (!candidate_order.empty()) {
+            size_t first_idx = candidate_order[0];
+            auto& shape = layout_.sheet_parts[0][first_idx];
+            shape.update();
+            auto bbox = shape.transformed.bbox();
+            double shape_width = safe_to_double(bbox.xmax() - bbox.xmin());
+            double shape_height = safe_to_double(bbox.ymax() - bbox.ymin());
+            shape.set_translate(geo::FT(radius - shape_width / 2.0 + radius * 0.3),
+                                geo::FT(radius - shape_height / 2.0 + radius * 0.3));
+            shape.update();
+
+            if (is_valid_placement(first_idx, empty_placed)) {
+                placed_indices.push_back(first_idx);
+            } else if (place_shape_with_nfp(first_idx, empty_placed, params_.try_all_rotations)) {
+                placed_indices.push_back(first_idx);
+            }
+        }
+
+        // 放置剩余零件
+        for (size_t i = 1; i < candidate_order.size(); ++i) {
+            if (requestQuit && *requestQuit) break;
+            size_t shape_idx = candidate_order[i];
+            bool placed = place_shape_with_nfp(shape_idx, placed_indices, false);
+            if (!placed && params_.try_all_rotations) {
+                placed = place_shape_with_nfp(shape_idx, placed_indices, true);
+            }
+            if (placed) {
+                placed_indices.push_back(shape_idx);
+            }
+        }
+
+        // 评估
+        size_t current_placed = placed_indices.size();
+        if (current_placed > best_placed_count) {
+            best_placed_count = current_placed;
+            best_util = calculate_utilization();
+            best_order = candidate_order;
+            best_layout = layout_.sheet_parts;
+            has_best_layout = true;
+        } else if (current_placed == best_placed_count) {
+            double current_util = calculate_utilization();
+            if (current_util > best_util) {
+                best_util = current_util;
+                best_order = candidate_order;
+                best_layout = layout_.sheet_parts;
+                has_best_layout = true;
+            }
+        }
+    }
+
+    // 恢复最佳布局
+    if (has_best_layout) {
+        layout_.sheet_parts = std::move(best_layout);
+    } else {
+        layout_.sheet_parts = std::move(original_parts);
+    }
+
+    return best_order;
+}
+
 double CircleNesting::binary_search_diameter(double min_diameter, double max_diameter,
                                              double target_utilization, volatile bool* requestQuit,
                                              std::function<void(const Layout&)> progress_callback) {
@@ -1254,9 +1438,24 @@ double CircleNesting::binary_search_diameter(double min_diameter, double max_dia
         
         double test_diameter = (min_diameter + max_diameter) / 2.0;
         
-        if (try_place_all_parts(test_diameter, requestQuit, &progress_callback)) {
+        // 使用调度算法尝试多种顺序，找到最佳放置方案
+        schedule_best_order(test_diameter, requestQuit, &progress_callback);
+        
+        // 检查是否成功放置了零件
+        size_t placed_count = 0;
+        for (const auto& shape : layout_.sheet_parts[0]) {
+            auto bbox = shape.transformed.bbox();
+            double cx = safe_to_double(bbox.xmin() + bbox.xmax()) / 2.0;
+            double cy = safe_to_double(bbox.ymin() + bbox.ymax()) / 2.0;
+            double radius = test_diameter / 2.0;
+            if (cx > 0 && cy > 0 && cx < test_diameter && cy < test_diameter) {
+                placed_count++;
+            }
+        }
+        
+        if (placed_count > 0) {
             // 紧凑化
-            compact_layout(params_.compact_iterations / 2, requestQuit, &progress_callback); // 二分查找时用较少迭代
+            compact_layout(params_.compact_iterations / 2, requestQuit, &progress_callback);
             
             double util = calculate_utilization();
             

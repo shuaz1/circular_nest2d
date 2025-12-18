@@ -42,6 +42,11 @@ namespace nesting {
             // 旋转精度（度数）
             double rotation_precision = 1.0;      // 默认1度精度
 
+            // 调度算法参数
+            bool use_scheduling = true;           // 是否启用多顺序调度搜索
+            size_t scheduling_attempts = 5;       // 调度尝试次数（不同顺序）
+            bool use_random_shuffle = true;       // 是否使用随机洗牌生成新顺序
+
             // 阵列排样模式参数（可选）
             bool use_array_mode = false;          // 是否启用阵列排样模式（默认关闭，保持兼容）
             double array_pitch_x = 0.0;           // 阵列X方向间距（0表示自动：零件宽度+间隙）
@@ -100,6 +105,10 @@ namespace nesting {
 
         // 智能排序：考虑面积、形状复杂度、长宽比
         std::vector<size_t> smart_order_parts() const;
+
+        // 调度算法：尝试多种放置顺序，返回最优顺序
+        std::vector<size_t> schedule_best_order(double diameter, volatile bool* requestQuit,
+                                                 std::function<void(const Layout&)>* progress_callback);
 
         // 计算零件的形状复杂度（用于排序）
         double calculate_shape_complexity(size_t shape_idx) const;
