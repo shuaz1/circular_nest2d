@@ -385,6 +385,16 @@
              </widget>
             </item>
             <item>
+             <widget class="QCheckBox" name="fastModeCheckBox">
+              <property name="text">
+               <string>Ultra Fast Mode</string>
+              </property>
+              <property name="toolTip">
+               <string>Speed-first mode: much faster, utilization may be slightly lower</string>
+              </property>
+             </widget>
+            </item>
+            <item>
             <widget class="QWidget" name="arrayModeContainer" native="true">
              <layout class="QGridLayout" name="gridLayout_array">
               <item row="0" column="0">

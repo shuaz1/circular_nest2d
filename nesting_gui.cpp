@@ -559,6 +559,7 @@ void nesting_gui::start() {
     }
     // 其他参数
     auto need_simplify = ui.needSimplify->isChecked();
+    auto fast_mode = ui.fastModeCheckBox ? ui.fastModeCheckBox->isChecked() : false;
     auto part_offset = ui.partSpacingSpinBox->value();
     auto top_offset = ui.TopSpinBox->value();
     auto bottom_offset = ui.BottomSpinBox->value();
@@ -586,12 +587,15 @@ void nesting_gui::start() {
     ui.RightSpinBox->setDisabled(true);
     ui.fixRun->setDisabled(true);
     ui.needSimplify->setDisabled(true);
+    if (ui.fastModeCheckBox) {
+        ui.fastModeCheckBox->setDisabled(true);
+    }
     // 开启时钟
     time = 0;
     timer->start(1000);
     startWork(need_simplify, top_offset, left_offset, bottom_offset, right_offset,
         part_offset, sheet_width, sheet_height, seconds, polygons,
-        allowed_rotations, quantity, segments);
+        allowed_rotations, quantity, segments, fast_mode);
 }
 
 void nesting_gui::stop() {
@@ -719,7 +723,8 @@ void nesting_gui::startWork(
     const std::vector<nesting::geo::Polygon_with_holes_2>& polygons,
     const std::vector<uint32_t>& items_rotations,
     const std::vector<uint32_t>& items_quantity,
-    const int circle_segments) {
+    const int circle_segments,
+    const bool fast_mode) {
     // Part6 设置线程
     qDebug() << "start work START";
     worker = new Worker(this);
@@ -728,7 +733,7 @@ void nesting_gui::startWork(
     connect(worker, &Worker::sendMessage, this, &nesting_gui::handleMessage);
     worker->set(need_simplify, top_offset, left_offset, bottom_offset,
         right_offset, part_offset, sheet_width, sheet_height, max_time,
-        polygons, items_rotations, items_quantity, circle_segments);
+        polygons, items_rotations, items_quantity, circle_segments, fast_mode);
     worker->start();
     qDebug() << "start work END";
 }

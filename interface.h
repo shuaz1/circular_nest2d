@@ -39,8 +39,10 @@ namespace nesting {
         std::function<void(const Solution&)> ProgressHandler,
         volatile bool* requestQuit);
 
-    // 圆形板材高利用率排样算法（目标92%+利用率）
+    // 圆形板材高利用率排样算法
+    // fast_mode = true 时，启用极速模式：大幅减少迭代与候选点数量，以速度优先
     void start_ga(Layout& layout,
         std::function<void(const Solution&)> ProgressHandler,
-        volatile bool* requestQuit);
+        volatile bool* requestQuit,
+        bool fast_mode);
 }  // namespace nesting

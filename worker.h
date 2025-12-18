@@ -31,7 +31,8 @@ public:
         const size_t _max_time,
         const std::vector<nesting::geo::Polygon_with_holes_2>& _polygons,
         const std::vector<uint32_t>& _items_rotations,
-        const std::vector<uint32_t>& _items_quantity) {
+        const std::vector<uint32_t>& _items_quantity,
+        const bool _fast_mode) {
         need_simplify = _need_simplify;
         top_offset = _top_offset;
         left_offset = _left_offset;
@@ -44,6 +45,7 @@ public:
         polygons = _polygons;
         items_rotations = _items_rotations;
         items_quantity = _items_quantity;
+        fast_mode = _fast_mode;
     }
     void set(const bool _need_simplify,
         const double _top_offset,
@@ -57,10 +59,11 @@ public:
         const std::vector<nesting::geo::Polygon_with_holes_2>& _polygons,
         const std::vector<uint32_t>& _items_rotations,
         const std::vector<uint32_t>& _items_quantity,
-        const int _circle_segments) {
+        const int _circle_segments,
+        const bool _fast_mode) {
         set(_need_simplify, _top_offset, _left_offset, _bottom_offset, _right_offset,
             _part_offset, _sheet_width, _sheet_height, _max_time,
-            _polygons, _items_rotations, _items_quantity);
+            _polygons, _items_rotations, _items_quantity, _fast_mode);
         circle_segments = _circle_segments;
     }
     void run() override {
@@ -92,6 +95,7 @@ private:
     std::vector<uint32_t> items_rotations;
     std::vector<uint32_t> items_quantity;
     int circle_segments{ 128 };
+    bool fast_mode{ false };
     std::function<void(const Solution&)> h =
         std::bind(&Worker::hook, this, std::placeholders::_1);
     nesting::Preprocess* p{ nullptr };
@@ -123,7 +127,7 @@ private:
         // 2. 核心排样阶段
         try {
             // 使用 CircleNesting / 调度 / 阵列模式进行全局优化（内部会调用局部精修）
-            nesting::start_ga(p->layout, h, &isRequestQuit);
+            nesting::start_ga(p->layout, h, &isRequestQuit, fast_mode);
         }
         catch (const std::runtime_error& e) {
             emit sendMessage(e.what());

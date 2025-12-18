@@ -711,8 +711,11 @@ void CircleNesting::compact_layout(size_t iterations, volatile bool* requestQuit
     std::vector<std::pair<double, double>> directions;
     directions.reserve(4);
 
+    bool should_quit = false;
+
     for (size_t iter = 0; iter < iterations; ++iter) {
         if (requestQuit && *requestQuit) {
+            should_quit = true;
             break;
         }
 
@@ -722,6 +725,10 @@ void CircleNesting::compact_layout(size_t iterations, volatile bool* requestQuit
         std::shuffle(indices.begin(), indices.end(), gen);
 
         for (size_t idx : indices) {
+            if (requestQuit && *requestQuit) {
+                should_quit = true;
+                break;
+            }
             auto& shape = layout_.sheet_parts[0][idx];
             
             // ============================================================
@@ -729,7 +736,7 @@ void CircleNesting::compact_layout(size_t iterations, volatile bool* requestQuit
             // 偶尔将当前零件从当前位置拿起，重新通过 NFP 候选点寻找更紧凑的位置，
             // 相当于对该零件做一次“局部重新排布”。
             // ============================================================
-            if (params_.prioritize_compact_positions && iter % 20 == 0) {
+            if (!should_quit && params_.prioritize_compact_positions && iter % 20 == 0) {
                 // 构造"其他零件"集合（复用预分配的容器）
                 other_indices.clear();
                 for (size_t j = 0; j < layout_.poly_num; ++j) {
@@ -816,6 +823,10 @@ void CircleNesting::compact_layout(size_t iterations, volatile bool* requestQuit
 
             // 尝试每个方向
             for (const auto& dir : directions) {
+                if (requestQuit && *requestQuit) {
+                    should_quit = true;
+                    break;
+                }
                 double current_x = shape.get_translate_double_x();
                 double current_y = shape.get_translate_double_y();
                 
@@ -839,7 +850,7 @@ void CircleNesting::compact_layout(size_t iterations, volatile bool* requestQuit
                     }
                 }
 
-                if (is_valid_placement(idx, other_indices)) {
+                if (!should_quit && is_valid_placement(idx, other_indices)) {
                     double new_utilization = calculate_utilization();
                     double delta = new_utilization - current_utilization;
                     
@@ -872,6 +883,10 @@ void CircleNesting::compact_layout(size_t iterations, volatile bool* requestQuit
             }
         }
 
+        if (should_quit) {
+            break;
+        }
+
         // 降低温度（模拟退火）
         if (params_.use_simulated_annealing) {
             temperature *= params_.sa_cooling_rate;
@@ -901,7 +916,7 @@ void CircleNesting::compact_layout(size_t iterations, volatile bool* requestQuit
         }
     }
     
-    // 紧凑化结束后，确保更新最佳结果
+    // 紧凑化结束后，确保更新最佳结果（如果中途退出，也尽量用当前状态）
     double final_utilization = calculate_utilization();
     if (final_utilization > best_utilization_) {
         best_utilization_ = final_utilization;
@@ -943,6 +958,11 @@ bool CircleNesting::optimize_diameter(double target_utilization, volatile bool* 
             }
 
             if (try_place_all_parts(test_diameter, requestQuit, &progress_callback)) {
+                // 如果用户已经请求退出，不再进入耗时的紧凑化阶段
+                if (requestQuit && *requestQuit) {
+                    break;
+                }
+
                 compact_layout(params_.compact_iterations, requestQuit, &progress_callback);
                 
                 double util = calculate_utilization();
@@ -973,8 +993,13 @@ bool CircleNesting::optimize_diameter(double target_utilization, volatile bool* 
         if (!try_place_all_parts(best_diameter, requestQuit, &progress_callback)) {
             return false;
         }
-        // 最终紧凑化（使用更多迭代）
-        compact_layout(params_.compact_iterations, requestQuit, &progress_callback);
+
+        // 如果此时已经请求退出，就不要再进入最终紧凑化，直接用当前结果
+        if (!(requestQuit && *requestQuit)) {
+            // 最终紧凑化（使用更多迭代）
+            compact_layout(params_.compact_iterations, requestQuit, &progress_callback);
+        }
+
         best_utilization_ = calculate_utilization();
         layout_.best_utilization = best_utilization_;
         layout_.best_result = layout_.sheet_parts;
@@ -1198,6 +1223,18 @@ bool CircleNesting::optimize(double target_utilization, volatile bool* requestQu
 
         // 首先尝试在当前直径下放置
         if (!try_place_all_parts(safe_to_double(layout_.sheets[0].diameter), requestQuit, &progress_callback)) {
+            return false;
+        }
+
+        // 如果用户已经请求退出，跳过后续紧凑化和直径优化，直接用当前结果
+        if (requestQuit && *requestQuit) {
+            double util_now = calculate_utilization();
+            best_utilization_ = util_now;
+            layout_.best_utilization = best_utilization_;
+            layout_.best_result = layout_.sheet_parts;
+            if (progress_callback) {
+                progress_callback(layout_);
+            }
             return false;
         }
 

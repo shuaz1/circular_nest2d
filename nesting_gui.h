@@ -28,7 +28,8 @@ public:
         const size_t max_time,
         const std::vector<nesting::geo::Polygon_with_holes_2>& polygons,
         const std::vector<uint32_t>& items_rotations,
-        const std::vector<uint32_t>& items_quantity);
+        const std::vector<uint32_t>& items_quantity,
+        const bool fast_mode);
     void startWork(
         const bool need_simplify,
         const double top_offset,
@@ -42,7 +43,8 @@ public:
         const std::vector<nesting::geo::Polygon_with_holes_2>& polygons,
         const std::vector<uint32_t>& items_rotations,
         const std::vector<uint32_t>& items_quantity,
-        const int circle_segments);
+        const int circle_segments,
+        const bool fast_mode);
     void storeData(std::vector<nesting::geo::Polygon_with_holes_2> pgns,
         std::vector<std::uint32_t> rots,
         std::vector<std::uint32_t> quat);
