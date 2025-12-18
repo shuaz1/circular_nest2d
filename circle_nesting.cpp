@@ -918,11 +918,213 @@ bool CircleNesting::optimize_diameter(double target_utilization, volatile bool* 
     return false;
 }
 
+bool CircleNesting::optimize_array_mode(double target_utilization, volatile bool* requestQuit,
+                                        std::function<void(const Layout&)> progress_callback) {
+    // 阵列模式：在当前直径下，通过搜索一组候选步距(pitch)，
+    // 近似寻找“放件数尽量多、利用率尽量高”的周期阵列（简化版最小阵列思想）。
+    if (layout_.sheet_parts.empty() || layout_.sheet_parts[0].empty()) {
+        return false;
+    }
+
+    double radius = safe_to_double(layout_.sheets[0].diameter) / 2.0;
+    double center_x = radius;
+    double center_y = radius;
+
+    // 选第一个零件作为阵列单元的尺寸参考（假定大部分零件尺寸相近）
+    const auto& first_shape = layout_.sheet_parts[0][0];
+    geo::Polygon_with_holes_2 base_poly = *first_shape.base;
+    auto bbox = base_poly.outer_boundary().bbox();
+    double shape_width = safe_to_double(bbox.xmax() - bbox.xmin());
+    double shape_height = safe_to_double(bbox.ymax() - bbox.ymin());
+    if (shape_width <= 0 || shape_height <= 0) {
+        return false;
+    }
+
+    // 基准阵列步距：用户指定优先，否则自动 = 尺寸 + 适当间隙（取10%尺寸）
+    double gap_x = 0.1 * shape_width;
+    double gap_y = 0.1 * shape_height;
+    double margin = std::max(0.0, params_.array_margin);
+
+    // 构造一组候选步距缩放因子（围绕基准pitch做搜索）
+    std::vector<double> scale_candidates = { 0.9, 1.0, 1.1 };
+    double base_pitch_x = (params_.array_pitch_x > 0.0) ? params_.array_pitch_x : (shape_width + gap_x);
+    double base_pitch_y = (params_.array_pitch_y > 0.0) ? params_.array_pitch_y : (shape_height + gap_y);
+    if (base_pitch_x <= 0 || base_pitch_y <= 0) {
+        return false;
+    }
+
+    // 备份初始布局（仅关心 sheet_parts）
+    auto original_parts = layout_.sheet_parts;
+
+    double best_util = 0.0;
+    size_t best_placed_count = 0;
+    std::vector<std::vector<TransformedShape>> best_parts;
+
+    for (double sx : scale_candidates) {
+        for (double sy : scale_candidates) {
+            if (requestQuit && *requestQuit) {
+                break;
+            }
+
+            double pitch_x = base_pitch_x * sx;
+            double pitch_y = base_pitch_y * sy;
+            if (pitch_x <= 0 || pitch_y <= 0) {
+                continue;
+            }
+
+            // 还原布局
+            layout_.sheet_parts = original_parts;
+
+            // 先把所有零件移到板外，避免视觉干扰
+            double outside_offset = -radius * 2.0;
+            for (auto& shape : layout_.sheet_parts[0]) {
+                shape.set_translate(geo::FT(outside_offset), geo::FT(outside_offset));
+                shape.update();
+            }
+
+            // 为当前 pitch 生成阵列格点
+            std::vector<geo::Point_2> grid_points;
+            int max_ix = static_cast<int>(std::ceil((radius - margin) / pitch_x)) + 2;
+            int max_iy = static_cast<int>(std::ceil((radius - margin) / pitch_y)) + 2;
+
+            for (int iy = -max_iy; iy <= max_iy; ++iy) {
+                for (int ix = -max_ix; ix <= max_ix; ++ix) {
+                    double gx = center_x + ix * pitch_x;
+                    double gy = center_y + iy * pitch_y;
+
+                    double tx = gx - shape_width / 2.0;
+                    double ty = gy - shape_height / 2.0;
+
+                    double corners_x[2] = { tx, tx + shape_width };
+                    double corners_y[2] = { ty, ty + shape_height };
+                    double max_dist_sq = 0.0;
+                    for (int cx_i = 0; cx_i < 2; ++cx_i) {
+                        for (int cy_i = 0; cy_i < 2; ++cy_i) {
+                            double dx = corners_x[cx_i] - center_x;
+                            double dy = corners_y[cy_i] - center_y;
+                            double d2 = dx * dx + dy * dy;
+                            if (d2 > max_dist_sq) {
+                                max_dist_sq = d2;
+                            }
+                        }
+                    }
+                    double limit_r = std::max(0.0, radius - margin);
+                    if (max_dist_sq <= limit_r * limit_r) {
+                        grid_points.emplace_back(geo::FT(tx), geo::FT(ty));
+                    }
+                }
+            }
+
+            if (grid_points.empty()) {
+                continue;
+            }
+
+            // 按“离圆心距离”排序，优先内部格点
+            std::sort(grid_points.begin(), grid_points.end(),
+                [&](const geo::Point_2& a, const geo::Point_2& b) {
+                    double ax = safe_to_double(a.x()) + shape_width / 2.0;
+                    double ay = safe_to_double(a.y()) + shape_height / 2.0;
+                    double bx = safe_to_double(b.x()) + shape_width / 2.0;
+                    double by = safe_to_double(b.y()) + shape_height / 2.0;
+                    double da2 = (ax - center_x) * (ax - center_x) + (ay - center_y) * (ay - center_y);
+                    double db2 = (bx - center_x) * (bx - center_x) + (by - center_y) * (by - center_y);
+                    return da2 < db2;
+                });
+
+            std::vector<size_t> placed_indices;
+            size_t grid_idx = 0;
+
+            // 固定旋转：阵列模式一般不希望乱转，这里用当前rotation，不额外旋转
+            for (size_t i = 0; i < layout_.poly_num && grid_idx < grid_points.size(); ++i) {
+                if (requestQuit && *requestQuit) {
+                    break;
+                }
+
+                auto& shape = layout_.sheet_parts[0][i];
+                shape.update();
+
+                for (; grid_idx < grid_points.size(); ++grid_idx) {
+                    auto tx = grid_points[grid_idx].x();
+                    auto ty = grid_points[grid_idx].y();
+
+                    auto old_x = shape.get_translate_ft_x();
+                    auto old_y = shape.get_translate_ft_y();
+
+                    shape.set_translate(tx, ty);
+                    shape.update();
+
+                    if (is_valid_placement(i, placed_indices)) {
+                        placed_indices.push_back(i);
+                        ++grid_idx;
+                        break;
+                    } else {
+                        shape.set_translate(old_x, old_y);
+                        shape.update();
+                    }
+                }
+            }
+
+            // 未放置零件移到板外，方便查看
+            double outside_offset_final = -radius * 2.5;
+            std::set<size_t> placed_set(placed_indices.begin(), placed_indices.end());
+            for (size_t i = 0; i < layout_.poly_num; ++i) {
+                if (placed_set.find(i) == placed_set.end()) {
+                    auto& shape = layout_.sheet_parts[0][i];
+                    double offset_x = outside_offset_final + i * radius * 0.1;
+                    double offset_y = outside_offset_final;
+                    shape.set_translate(geo::FT(offset_x), geo::FT(offset_y));
+                    shape.update();
+                }
+            }
+
+            // 评估当前阵列：先看放了多少件，再看利用率
+            size_t placed_count = placed_indices.size();
+            double util = calculate_utilization();
+
+            if (placed_count > best_placed_count ||
+                (placed_count == best_placed_count && util > best_util)) {
+                best_placed_count = placed_count;
+                best_util = util;
+                best_parts = layout_.sheet_parts;
+            }
+        }
+    }
+
+    if (best_placed_count == 0 || best_parts.empty()) {
+        // 没有找到任何可行阵列
+        layout_.sheet_parts = original_parts;
+        best_utilization_ = 0.0;
+        layout_.best_utilization = 0.0;
+        layout_.best_result = layout_.sheet_parts;
+        if (progress_callback) {
+            progress_callback(layout_);
+        }
+        return false;
+    }
+
+    // 使用搜索到的最佳阵列布局
+    layout_.sheet_parts = best_parts;
+    best_utilization_ = best_util;
+    layout_.best_utilization = best_utilization_;
+    layout_.best_result = layout_.sheet_parts;
+
+    if (progress_callback) {
+        progress_callback(layout_);
+    }
+
+    return best_utilization_ >= target_utilization;
+}
+
 bool CircleNesting::optimize(double target_utilization, volatile bool* requestQuit,
                              std::function<void(const Layout&)> progress_callback) {
     best_utilization_ = 0.0;
     
     try {
+        // 阵列模式：直接走阵列排样逻辑（不做直径搜索）
+        if (params_.use_array_mode) {
+            return optimize_array_mode(target_utilization, requestQuit, progress_callback);
+        }
+
         // 首先尝试在当前直径下放置
         if (!try_place_all_parts(safe_to_double(layout_.sheets[0].diameter), requestQuit, &progress_callback)) {
             return false;

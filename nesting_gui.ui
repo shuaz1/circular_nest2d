@@ -298,6 +298,17 @@
               </property>
              </widget>
             </item>
+            <!-- 阵列排样：模式勾选 + 间距/边距设置 -->
+            <item row="1" column="2">
+             <widget class="QCheckBox" name="arrayModeCheckBox">
+              <property name="text">
+               <string>Array Mode</string>
+              </property>
+              <property name="toolTip">
+               <string>Use regular array grid instead of free nesting</string>
+              </property>
+             </widget>
+            </item>
             <item row="0" column="0" alignment="Qt::AlignHCenter">
              <widget class="QLabel" name="label_11">
               <property name="font">
@@ -374,17 +385,84 @@
              </widget>
             </item>
             <item>
-             <spacer name="verticalSpacer_5">
-              <property name="orientation">
-               <enum>Qt::Vertical</enum>
-              </property>
-              <property name="sizeHint" stdset="0">
-               <size>
-                <width>20</width>
-                <height>40</height>
-               </size>
-              </property>
-             </spacer>
+            <widget class="QWidget" name="arrayModeContainer" native="true">
+             <layout class="QGridLayout" name="gridLayout_array">
+              <item row="0" column="0">
+               <widget class="QLabel" name="label_array_mode">
+                <property name="text">
+                 <string>Array Nesting</string>
+                </property>
+               </widget>
+              </item>
+              <item row="0" column="1">
+               <widget class="QCheckBox" name="arrayModeCheckBox">
+                <property name="text">
+                 <string>Enable</string>
+                </property>
+               </widget>
+              </item>
+              <item row="1" column="0">
+               <widget class="QLabel" name="label_array_pitch_x">
+                <property name="text">
+                 <string>Pitch X</string>
+                </property>
+               </widget>
+              </item>
+              <item row="1" column="1">
+               <widget class="QDoubleSpinBox" name="arrayPitchXSpinBox">
+                <property name="decimals">
+                 <number>3</number>
+                </property>
+                <property name="maximum">
+                 <double>1000000.000000000000000</double>
+                </property>
+                <property name="singleStep">
+                 <double>1.000000000000000</double>
+                </property>
+               </widget>
+              </item>
+              <item row="2" column="0">
+               <widget class="QLabel" name="label_array_pitch_y">
+                <property name="text">
+                 <string>Pitch Y</string>
+                </property>
+               </widget>
+              </item>
+              <item row="2" column="1">
+               <widget class="QDoubleSpinBox" name="arrayPitchYSpinBox">
+                <property name="decimals">
+                 <number>3</number>
+                </property>
+                <property name="maximum">
+                 <double>1000000.000000000000000</double>
+                </property>
+                <property name="singleStep">
+                 <double>1.000000000000000</double>
+                </property>
+               </widget>
+              </item>
+              <item row="3" column="0">
+               <widget class="QLabel" name="label_array_margin">
+                <property name="text">
+                 <string>Margin</string>
+                </property>
+               </widget>
+              </item>
+              <item row="3" column="1">
+               <widget class="QDoubleSpinBox" name="arrayMarginSpinBox">
+                <property name="decimals">
+                 <number>3</number>
+                </property>
+                <property name="maximum">
+                 <double>1000000.000000000000000</double>
+                </property>
+                <property name="singleStep">
+                 <double>1.000000000000000</double>
+                </property>
+               </widget>
+              </item>
+             </layout>
+            </widget>
             </item>
            </layout>
           </item>

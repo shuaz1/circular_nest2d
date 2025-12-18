@@ -41,6 +41,12 @@ namespace nesting {
 
             // 旋转精度（度数）
             double rotation_precision = 1.0;      // 默认1度精度
+
+            // 阵列排样模式参数（可选）
+            bool use_array_mode = false;          // 是否启用阵列排样模式（默认关闭，保持兼容）
+            double array_pitch_x = 0.0;           // 阵列X方向间距（0表示自动：零件宽度+间隙）
+            double array_pitch_y = 0.0;           // 阵列Y方向间距（0表示自动：零件高度+间隙）
+            double array_margin = 0.0;            // 阵列最外圈距离圆边的安全距离
         };
 
         void set_parameters(const Parameters& params);
@@ -69,6 +75,10 @@ namespace nesting {
         // 优化圆直径：从理论下界开始，逐步缩小直到无法放置
         bool optimize_diameter(double target_utilization, volatile bool* requestQuit,
                               std::function<void(const Layout&)> progress_callback);
+
+        // 阵列排样模式：在固定直径下生成规则阵列布局
+        bool optimize_array_mode(double target_utilization, volatile bool* requestQuit,
+                                 std::function<void(const Layout&)> progress_callback);
 
         // 在给定直径下尝试放置所有零件
         bool try_place_all_parts(double diameter, volatile bool* requestQuit,

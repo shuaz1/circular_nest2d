@@ -40,6 +40,8 @@ namespace nesting {
         params.prioritize_compact_positions = true;
         params.use_smart_ordering = true;  // 启用智能排序
         params.try_all_rotations = true;  // 尝试所有旋转角度
+        // 阵列模式相关参数由 GUI 侧控制（通过全局/静态配置或后续扩展），
+        // 这里保持默认：use_array_mode=false，仍然使用自由排样。
         circle_nesting.set_parameters(params);
         
         auto progress_wrapper = [&](const Layout& l) {
