@@ -237,31 +237,46 @@ bool CircleNesting::is_valid_placement(size_t shape_idx, const std::vector<size_
     }
 
     // ========== 约束2：检查是否与已放置零件重叠（不能重叠） ==========
+    // 优化：先用 bbox 快速排除，再用精确检测
+    auto bbox_i = shape.transformed.bbox();
+    
     for (size_t j : placed_indices) {
         if (j == shape_idx) continue;
         
         try {
             const auto& shape_j = layout_.sheet_parts[0][j];
-            geo::Polygon_set_2 ps1, ps2;
+            
+            // 快速检测：bbox 不相交则必定不重叠
+            auto bbox_j = shape_j.transformed.bbox();
+            if (bbox_i.xmax() < bbox_j.xmin() || bbox_i.xmin() > bbox_j.xmax() ||
+                bbox_i.ymax() < bbox_j.ymin() || bbox_i.ymin() > bbox_j.ymax()) {
+                continue; // bbox 不相交，跳过精确检测
+            }
+            
+            // 精确检测：CGAL 布尔运算
+            geo::Polygon_set_2 ps1(geo::traits);
             ps1.insert(shape.transformed.outer_boundary());
+            
+            geo::Polygon_set_2 ps2(geo::traits);
             ps2.insert(shape_j.transformed.outer_boundary());
             
             ps1.intersection(ps2);
-            std::vector<geo::Polygon_with_holes_2> intersection;
-            ps1.polygons_with_holes(std::back_inserter(intersection));
             
-            if (!intersection.empty()) {
+            if (!ps1.is_empty()) {
+                std::vector<geo::Polygon_with_holes_2> intersection;
+                intersection.reserve(4);
+                ps1.polygons_with_holes(std::back_inserter(intersection));
+                
                 double overlap_area = 0.0;
                 for (const auto& poly : intersection) {
                     overlap_area += safe_to_double(geo::pwh_area(poly));
                 }
-                if (overlap_area > 1e-6) { // 有重叠
+                if (overlap_area > 1e-6) {
                     return false;
                 }
             }
         }
         catch (...) {
-            // 如果计算失败，保守地认为有重叠
             return false;
         }
     }
@@ -671,9 +686,11 @@ void CircleNesting::compact_layout(size_t iterations, volatile bool* requestQuit
         return;
     }
 
-    double radius = safe_to_double(layout_.sheets[0].diameter) / 2.0;
-    double step_size = radius * params_.compact_step_size;
-    double search_radius = radius * params_.compact_radius_search;
+    // 缓存常用值，避免重复计算
+    const double radius = safe_to_double(layout_.sheets[0].diameter) / 2.0;
+    const double center_x = radius;
+    const double center_y = radius;
+    const double step_size = radius * params_.compact_step_size;
     
     // 模拟退火参数
     double temperature = params_.sa_initial_temp;
@@ -682,7 +699,17 @@ void CircleNesting::compact_layout(size_t iterations, volatile bool* requestQuit
     std::uniform_real_distribution<double> dis(0.0, 1.0);
 
     double current_utilization = calculate_utilization();
-    double best_utilization_this_compact = current_utilization; // 记录本次紧凑化的最佳利用率
+    double best_utilization_this_compact = current_utilization;
+
+    // 预分配，循环内复用
+    std::vector<size_t> indices(layout_.poly_num);
+    std::iota(indices.begin(), indices.end(), 0);
+    
+    std::vector<size_t> other_indices;
+    other_indices.reserve(layout_.poly_num);
+    
+    std::vector<std::pair<double, double>> directions;
+    directions.reserve(4);
 
     for (size_t iter = 0; iter < iterations; ++iter) {
         if (requestQuit && *requestQuit) {
@@ -692,8 +719,6 @@ void CircleNesting::compact_layout(size_t iterations, volatile bool* requestQuit
         bool improved = false;
         
         // 随机打乱顺序
-        std::vector<size_t> indices(layout_.poly_num);
-        std::iota(indices.begin(), indices.end(), 0);
         std::shuffle(indices.begin(), indices.end(), gen);
 
         for (size_t idx : indices) {
@@ -704,61 +729,53 @@ void CircleNesting::compact_layout(size_t iterations, volatile bool* requestQuit
             // 偶尔将当前零件从当前位置拿起，重新通过 NFP 候选点寻找更紧凑的位置，
             // 相当于对该零件做一次“局部重新排布”。
             // ============================================================
-            if (params_.prioritize_compact_positions) {
-                // 以一定概率或频率触发（避免过慢）：这里简单用迭代步长控制
-                if (iter % 20 == 0) {
-                    // 构造“其他零件”集合
-                    std::vector<size_t> other_indices;
-                    other_indices.reserve(layout_.poly_num - 1);
-                    for (size_t j = 0; j < layout_.poly_num; ++j) {
-                        if (j != idx) other_indices.push_back(j);
+            if (params_.prioritize_compact_positions && iter % 20 == 0) {
+                // 构造"其他零件"集合（复用预分配的容器）
+                other_indices.clear();
+                for (size_t j = 0; j < layout_.poly_num; ++j) {
+                    if (j != idx) other_indices.push_back(j);
+                }
+
+                auto old_x = shape.get_translate_ft_x();
+                auto old_y = shape.get_translate_ft_y();
+                uint32_t old_rot = shape.get_rotation();
+
+                // 使用现有 NFP 放置逻辑，对该零件做一次局部重定位
+                bool placed_better = place_shape_with_nfp(idx, other_indices, params_.try_all_rotations);
+                if (placed_better && is_valid_placement(idx, other_indices)) {
+                    double new_util = calculate_utilization();
+                    double delta = new_util - current_utilization;
+                    bool accept = false;
+                    if (delta > 0) {
+                        accept = true;
+                        improved = true;
+                        current_utilization = new_util;
+                        if (new_util > best_utilization_this_compact) {
+                            best_utilization_this_compact = new_util;
+                        }
+                    } else if (params_.use_simulated_annealing && temperature > 0) {
+                        double prob = std::exp(delta / temperature);
+                        if (dis(gen) < prob) {
+                            accept = true;
+                        }
                     }
 
-                    auto old_x = shape.get_translate_ft_x();
-                    auto old_y = shape.get_translate_ft_y();
-                    uint32_t old_rot = shape.get_rotation();
-
-                    // 使用现有 NFP 放置逻辑，对该零件做一次局部重定位
-                    bool placed_better = place_shape_with_nfp(idx, other_indices, params_.try_all_rotations);
-                    if (placed_better && is_valid_placement(idx, other_indices)) {
-                        double new_util = calculate_utilization();
-                        double delta = new_util - current_utilization;
-                        bool accept = false;
-                        if (delta > 0) {
-                            accept = true;
-                            improved = true;
-                            current_utilization = new_util;
-                            if (new_util > best_utilization_this_compact) {
-                                best_utilization_this_compact = new_util;
-                            }
-                        } else if (params_.use_simulated_annealing && temperature > 0) {
-                            double prob = std::exp(delta / temperature);
-                            if (dis(gen) < prob) {
-                                accept = true;
-                            }
-                        }
-
-                        if (!accept) {
-                            // 恢复原位与旋转
-                            shape.set_rotation(old_rot);
-                            shape.set_translate(old_x, old_y);
-                            shape.update();
-                        }
-                    } else {
-                        // 重定位失败则恢复
+                    if (!accept) {
                         shape.set_rotation(old_rot);
                         shape.set_translate(old_x, old_y);
                         shape.update();
                     }
+                } else {
+                    shape.set_rotation(old_rot);
+                    shape.set_translate(old_x, old_y);
+                    shape.update();
                 }
             }
 
-            // 多方向搜索：向中心、向最近零件、随机方向
-            std::vector<std::pair<double, double>> directions;
+            // 多方向搜索：向中心、向最近零件、随机方向（复用预分配的容器）
+            directions.clear();
             
             // 方向1：向中心
-            double center_x = radius;
-            double center_y = radius;
             auto bbox = shape.transformed.bbox();
             double cx = safe_to_double(bbox.xmin() + bbox.xmax()) / 2.0;
             double cy = safe_to_double(bbox.ymin() + bbox.ymax()) / 2.0;

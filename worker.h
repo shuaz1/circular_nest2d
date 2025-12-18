@@ -101,6 +101,8 @@ private:
     }
     void doWork() {
         qDebug() << "doWork START";
+
+        // 1. 预处理阶段：如果失败，不再继续往下跑，直接返回，避免空指针崩溃
         try {
             p = new nesting::Preprocess(nesting::preprocess(
                 need_simplify, top_offset, left_offset, bottom_offset, right_offset,
@@ -109,14 +111,24 @@ private:
         }
         catch (const std::runtime_error& e) {
             emit sendMessage(e.what());
+            p = nullptr;
         }
+
+        // 预处理失败或用户要求退出，直接结束
+        if (p == nullptr || isRequestQuit) {
+            qDebug() << "doWork ABORT (preprocess failed or quit requested)";
+            return;
+        }
+
+        // 2. 核心排样阶段
         try {
-            // 使用独立 GA 模式进行全局优化（内部会调用 minimize_overlap 做局部精修）
+            // 使用 CircleNesting / 调度 / 阵列模式进行全局优化（内部会调用局部精修）
             nesting::start_ga(p->layout, h, &isRequestQuit);
         }
         catch (const std::runtime_error& e) {
             emit sendMessage(e.what());
         }
+
         delete p;
         p = nullptr;
         qDebug() << "doWork DONE";
