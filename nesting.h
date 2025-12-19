@@ -13,6 +13,9 @@ namespace nesting {
     typedef typename hash::NFPCacheValue NFPCacheValue;
     typedef typename hash::NFPCacheKeyHasher NFPCacheKeyHasher;
 
+    // 全局安全转换函数：将 CGAL 精确数值转换为 double（使用 interval，避免抛异常）
+    double safe_to_double(const geo::FT& v);
+
     /// <summary>
     /// 求固定A环绕B得到的临界多边形NFP，A和B均为带孔多边形，NFP以带孔的多边形给出。
     /// <para>原理：minkowski之差，NFP=A(+)-B。可应用在带孔多边形上。</para>

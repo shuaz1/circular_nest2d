@@ -395,6 +395,16 @@
              </widget>
             </item>
             <item>
+             <widget class="QCheckBox" name="useClipperCheckBox">
+              <property name="text">
+               <string>Use Clipper</string>
+              </property>
+              <property name="toolTip">
+               <string>Use Clipper library for faster geometric operations (2-10x faster than CGAL)</string>
+              </property>
+             </widget>
+            </item>
+            <item>
             <widget class="QWidget" name="arrayModeContainer" native="true">
              <layout class="QGridLayout" name="gridLayout_array">
               <item row="0" column="0">

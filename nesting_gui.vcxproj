@@ -56,7 +56,7 @@
     <Import Project="$(QtMsBuild)\qt_defaults.props" />
   </ImportGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Debug|x64'" Label="QtSettings">
-    <QtInstall>6.9.2_msvc2022_64</QtInstall>
+    <QtInstall>6.9.3_msvc2022_64</QtInstall>
     <QtModules>core;xml;gui;svg;widgets;charts</QtModules>
     <QtBuildConfig>debug</QtBuildConfig>
   </PropertyGroup>
@@ -120,16 +120,19 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <ClCompile>
       <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>USE_CLIPPER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+      <PreprocessorDefinitions>USE_CLIPPER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <ClCompile>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+      <PreprocessorDefinitions>USE_CLIPPER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -137,9 +140,11 @@
       <WholeProgramOptimization>false</WholeProgramOptimization>
       <OpenMPSupport>true</OpenMPSupport>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalIncludeDirectories>F:\boost\boost_1_84_0;F:\2DNesting\nesting2d-master\nesting2d-master\CGAL-5.6.1\include;$(SolutionDir)CGAL-5.6.1\include;$(BOOST_INCLUDE_DIR);$(SolutionDir)libdxfrw;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>F:\boost\boost_1_84_0;F:\2DNesting\nesting2d-master\nesting2d-master\CGAL-5.6.1\include;$(SolutionDir)CGAL-5.6.1\include;$(SolutionDir)clipper\Clipper2-main\Clipper2-main\CPP\Clipper2Lib\include;$(BOOST_INCLUDE_DIR);$(SolutionDir)libdxfrw;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>USE_CLIPPER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <TreatAngleIncludeAsExternal>true</TreatAngleIncludeAsExternal>
       <DisableAnalyzeExternal>true</DisableAnalyzeExternal>
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <HeapReserveSize>100000000</HeapReserveSize>
@@ -148,6 +153,7 @@
       <StackCommitSize>100000000</StackCommitSize>
       <AdditionalLibraryDirectories>F:\boost\boost_1_84_0\lib64-msvc-14.3;F:\2DNesting\nesting2d-master\nesting2d-master\CGAL-5.6.1\lib;$(SolutionDir)CGAL-5.6.1\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>OpenGL32.Lib;libgmp-10.lib;libmpfr-4.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <EnableCOMDATFolding>false</EnableCOMDATFolding>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -156,9 +162,10 @@
       <AdditionalLibraryDirectories>$(SolutionDir)CGAL-5.6.1\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(SolutionDir)CGAL-5.6.1\include;$(BOOST_INCLUDE_DIR);$(SolutionDir)libdxfrw;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)CGAL-5.6.1\include;$(SolutionDir)clipper\Clipper2-main\Clipper2-main\CPP\Clipper2Lib\include;$(BOOST_INCLUDE_DIR);$(SolutionDir)libdxfrw;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+      <PreprocessorDefinitions>USE_CLIPPER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)' == 'Debug|x64'" Label="Configuration">
@@ -189,12 +196,12 @@
     <ClCompile>
       <TreatWChar_tAsBuiltInType>true</TreatWChar_tAsBuiltInType>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
-      <DebugInformationFormat>None</DebugInformationFormat>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <Optimization>MaxSpeed</Optimization>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
@@ -213,6 +220,11 @@
     <ClCompile Include="algorithm.cpp" />
     <ClCompile Include="candidate_points.cpp" />
     <ClCompile Include="circle_nesting.cpp" />
+    <ClCompile Include="clipper_wrapper.cpp" />
+    <ClCompile Include="clipper\Clipper2-main\Clipper2-main\CPP\Clipper2Lib\src\clipper.engine.cpp" />
+    <ClCompile Include="clipper\Clipper2-main\Clipper2-main\CPP\Clipper2Lib\src\clipper.offset.cpp" />
+    <ClCompile Include="clipper\Clipper2-main\Clipper2-main\CPP\Clipper2Lib\src\clipper.rectclip.cpp" />
+    <ClCompile Include="clipper\Clipper2-main\Clipper2-main\CPP\Clipper2Lib\src\clipper.triangulation.cpp" />
     <ClCompile Include="data_converter.cpp" />
     <ClCompile Include="dx_iface.cpp" />
     <ClCompile Include="layout.cpp" />
@@ -256,6 +268,7 @@
     <ClInclude Include="algorithm.h" />
     <ClInclude Include="basic.h" />
     <ClInclude Include="candidate_points.h" />
+    <ClInclude Include="clipper_wrapper.h" />
     <ClInclude Include="data_converter.h" />
     <ClInclude Include="dx_data.h" />
     <ClInclude Include="dx_iface.h" />

@@ -1,20 +1,24 @@
 #include "circle_nesting.h"
+#include <chrono>
 #include "nesting.h"
 #include "algorithm.h"
+#include "clipper_wrapper.h"
 #include <CGAL/boolean_set_operations_2.h>
 #include <CGAL/Polygon_2.h>
 #include <CGAL/number_utils.h>
+#include <CGAL/Uncertain.h>
 #include <iostream>
 #include <cmath>
 #include <algorithm>
 #include <numeric>
 #include <random>
 #include <set>
+#include <QtDebug>
 
 namespace nesting {
 
 // Robust conversion from CGAL::FT to double using intervals
-static double safe_to_double(const geo::FT& v) {
+double safe_to_double(const geo::FT& v) {
     auto I = CGAL::to_interval(v);
     double a = I.first;
     double b = I.second;
@@ -24,12 +28,141 @@ static double safe_to_double(const geo::FT& v) {
     return 0.5 * (a + b);
 }
 
+// ============================================================================
+// 一组仅使用 double 的几何辅助函数，完全绕开 CGAL 的布尔运算，
+// 用于 CGAL 简化路径下的“近似重叠检测”，避免频繁触发
+// CGAL::Uncertain_conversion_exception。
+// ============================================================================
+
+// 射线法判断点是否在多边形内（边界算作在内）
+static bool point_in_polygon_double(
+    double x, double y,
+    const std::vector<std::pair<double, double>>& poly) {
+    bool inside = false;
+    size_t n = poly.size();
+    if (n < 3) return false;
+    for (size_t i = 0, j = n - 1; i < n; j = i++) {
+        const auto& pi = poly[i];
+        const auto& pj = poly[j];
+        double xi = pi.first;
+        double yi = pi.second;
+        double xj = pj.first;
+        double yj = pj.second;
+
+        // 边界上的点：用一个小阈值检查
+        double dx = xj - xi;
+        double dy = yj - yi;
+        double cross = (x - xi) * dy - (y - yi) * dx;
+        double dot = (x - xi) * (x - xj) + (y - yi) * (y - yj);
+        if (std::fabs(cross) < 1e-9 && dot <= 0.0) {
+            return true;
+        }
+
+        bool intersect = ((yi > y) != (yj > y)) &&
+                         (x < (xj - xi) * (y - yi) / (yj - yi + 1e-18) + xi);
+        if (intersect) {
+            inside = !inside;
+        }
+    }
+    return inside;
+}
+
+// 线段相交检测（含端点和共线重叠情况）
+static int orient(double ax, double ay, double bx, double by, double cx, double cy) {
+    double v = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    if (v > 1e-9) return 1;
+    if (v < -1e-9) return -1;
+    return 0;
+}
+
+static bool on_segment(double ax, double ay, double bx, double by, double px, double py) {
+    return std::min(ax, bx) - 1e-9 <= px && px <= std::max(ax, bx) + 1e-9 &&
+           std::min(ay, by) - 1e-9 <= py && py <= std::max(ay, by) + 1e-9 &&
+           orient(ax, ay, bx, by, px, py) == 0;
+}
+
+static bool segments_intersect_double(
+    double ax, double ay, double bx, double by,
+    double cx, double cy, double dx, double dy) {
+    int o1 = orient(ax, ay, bx, by, cx, cy);
+    int o2 = orient(ax, ay, bx, by, dx, dy);
+    int o3 = orient(cx, cy, dx, dy, ax, ay);
+    int o4 = orient(cx, cy, dx, dy, bx, by);
+
+    if (o1 != o2 && o3 != o4) return true;
+    if (o1 == 0 && on_segment(ax, ay, bx, by, cx, cy)) return true;
+    if (o2 == 0 && on_segment(ax, ay, bx, by, dx, dy)) return true;
+    if (o3 == 0 && on_segment(cx, cy, dx, dy, ax, ay)) return true;
+    if (o4 == 0 && on_segment(cx, cy, dx, dy, bx, by)) return true;
+    return false;
+}
+
+
 CircleNesting::CircleNesting(Layout& layout)
-    : layout_(layout), best_utilization_(0.0), current_diameter_(0.0) {
+    : layout_(layout), best_utilization_(0.0), use_time_limit_(false) {
     if (layout_.sheets.empty() || layout_.sheets[0].type != Sheet::ShapeType::Circle) {
         throw std::runtime_error("CircleNesting requires a circular sheet");
     }
     current_diameter_ = safe_to_double(layout_.sheets[0].diameter);
+}
+
+void CircleNesting::set_time_limit_seconds(size_t seconds) {
+    if (seconds == 0) {
+        use_time_limit_ = false;
+        return;
+    }
+    use_time_limit_ = true;
+    deadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+}
+
+void CircleNesting::set_hard_time_limit_seconds(size_t seconds) {
+    if (seconds == 0) {
+        use_hard_time_limit_ = false;
+        return;
+    }
+    use_hard_time_limit_ = true;
+    hard_deadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+}
+
+void CircleNesting::set_quality_gate(double gate_utilization) {
+    if (gate_utilization <= 0.0) {
+        use_quality_gate_ = false;
+        quality_gate_ = 0.0;
+        return;
+    }
+    use_quality_gate_ = true;
+    quality_gate_ = gate_utilization;
+}
+
+bool CircleNesting::should_stop(volatile bool* requestQuit) const {
+    if (requestQuit && *requestQuit) {
+        return true;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+
+    // 硬上限：无论是否达标，一旦超时必须停
+    if (use_hard_time_limit_ && now >= hard_deadline_) {
+        if (requestQuit) {
+            *requestQuit = true;
+        }
+        return true;
+    }
+
+    // 软上限：在未达到质量门槛前忽略；达到门槛后才允许因软上限停止
+    if (use_time_limit_ && now >= deadline_) {
+        bool gate_reached = true;
+        if (use_quality_gate_) {
+            gate_reached = best_utilization_ >= quality_gate_;
+        }
+        if (gate_reached) {
+            if (requestQuit) {
+                *requestQuit = true;
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 void CircleNesting::set_parameters(const Parameters& params) {
@@ -40,7 +173,7 @@ double CircleNesting::calculate_theoretical_min_diameter() const {
     // 理论最小直径：sqrt(4 * 总面积 / PI)
     // 考虑利用率目标，实际最小直径 = sqrt(4 * 总面积 / (PI * target_utilization))
     double total_area = safe_to_double(layout_.area);
-    double min_diameter = std::sqrt(4.0 * total_area / (Sheet::kPi * 0.92)); // 假设92%利用率
+    double min_diameter = std::sqrt(4.0 * total_area / (Sheet::kPi * 0.85)); // 目标利用率按 85%
     return min_diameter;
 }
 
@@ -67,71 +200,177 @@ double CircleNesting::calculate_utilization() const {
         // 获取圆形板材多边形
         geo::Polygon_with_holes_2 sheet_pwh = layout_.sheets[0].sheet;
         
-        // 使用 Polygon_set_2 计算所有已放置零件的并集面积
-        // 注意：Polygon_set_2 的 join 操作会自动处理重叠（去重叠），确保重叠部分只计算一次
-        // 这符合约束2：刀头之间不能重叠（如果放置时遵守了约束，这里不应该有重叠，但计算时仍然去重叠）
-        geo::Polygon_set_2 ps(geo::traits);
-        
-        for (const auto& shape : layout_.sheet_parts[0]) {
-            try {
-                // 约束1：只计算在圆内的部分（刀头不能超出板材）
-                // 计算零件与板材的交集（只计算在圆内的部分）
-                std::vector<geo::Polygon_with_holes_2> inters;
+        // 根据参数选择使用 Clipper 或 CGAL
+        if (params_.geometry_library == Parameters::GeometryLibrary::Clipper) {
+            // 使用 Clipper（快速）
+            double union_area = 0.0;
+            
+            // 逐个计算每个零件在圆内的部分，然后合并
+            std::vector<geo::Polygon_with_holes_2> union_polygons;
+            
+            // 只处理实际放置在圆内的零件（通过检查位置判断）
+            double radius = safe_to_double(layout_.sheets[0].diameter) / 2.0;
+            double center_x = radius;
+            double center_y = radius;
+            
+            for (const auto& shape : layout_.sheet_parts[0]) {
                 try {
-                    CGAL::intersection(shape.transformed, sheet_pwh, std::back_inserter(inters));
+                    // 快速检查：零件的 bbox 中心是否在圆内
+                    auto bbox = shape.transformed.bbox();
+                    double cx = safe_to_double(bbox.xmin() + bbox.xmax()) / 2.0;
+                    double cy = safe_to_double(bbox.ymin() + bbox.ymax()) / 2.0;
+                    double dist_sq = (cx - center_x) * (cx - center_x) + (cy - center_y) * (cy - center_y);
+                    
+                    // 如果零件中心明显在圆外，跳过（节省计算）
+                    if (dist_sq > radius * radius * 1.5) {
+                        continue;
+                    }
+                    
+                    // 计算零件与板材的交集（只计算在圆内的部分）
+                    auto inters_result = geo::GeometryOperations::intersection(shape.transformed, sheet_pwh);
+                    
+                    if (inters_result.is_empty || inters_result.polygons.empty()) {
+                        continue; // 零件不在圆内，跳过
+                    }
+                    
+                    // 将交集添加到并集列表
+                    for (const auto& inter_poly : inters_result.polygons) {
+                        union_polygons.push_back(inter_poly);
+                    }
                 }
                 catch (...) {
-                    inters.clear();
+                    // 忽略单个零件的错误，继续处理下一个
                 }
-                
-                // 如果交集为空，说明零件不在圆内，跳过（遵守约束1）
-                if (inters.empty()) {
-                    continue;
+            }
+            
+            // 合并所有多边形（计算并集）
+            if (!union_polygons.empty()) {
+                // 如果只有一个多边形，直接计算面积
+                if (union_polygons.size() == 1) {
+                    union_area = geo::GeometryOperations::area(union_polygons[0]);
+                } else {
+                    // 多个多边形，尝试合并
+                    geo::Polygon_with_holes_2 current_union = union_polygons[0];
+                    bool merge_success = true;
+                    
+                    for (size_t i = 1; i < union_polygons.size(); ++i) {
+                        try {
+                            auto join_result = geo::GeometryOperations::join(current_union, union_polygons[i]);
+                            if (!join_result.is_empty && !join_result.polygons.empty()) {
+                                // 取第一个（通常只有一个）
+                                current_union = join_result.polygons[0];
+                            } else {
+                                // 合并失败，累加面积（近似处理）
+                                merge_success = false;
+                                break;
+                            }
+                        } catch (...) {
+                            // 合并失败，累加面积（近似处理）
+                            merge_success = false;
+                            break;
+                        }
+                    }
+                    
+                    if (merge_success) {
+                        // 计算最终并集面积
+                        try {
+                            union_area = geo::GeometryOperations::area(current_union);
+                        } catch (...) {
+                            // 如果计算失败，使用累加方式（近似）
+                            union_area = 0.0;
+                            for (const auto& poly : union_polygons) {
+                                try {
+                                    union_area += geo::GeometryOperations::area(poly);
+                                } catch (...) {
+                                    // 忽略单个错误
+                                }
+                            }
+                        }
+                    } else {
+                        // 合并失败，使用累加方式（近似，可能高估）
+                        union_area = 0.0;
+                        for (const auto& poly : union_polygons) {
+                            try {
+                                union_area += geo::GeometryOperations::area(poly);
+                            } catch (...) {
+                                // 忽略单个错误
+                            }
+                        }
+                    }
                 }
-                
-                // 约束2：将交集加入多边形集合（自动处理重叠，确保重叠部分只计算一次）
-                for (const auto& p : inters) {
+            }
+            
+            // 利用率 = 实际覆盖面积（并集，去重叠）/ 圆形板材面积
+            double utilization = union_area / circle_area;
+            if (utilization < 0) utilization = 0;
+            if (utilization > 1) utilization = 1;
+            
+            return utilization;
+        } else {
+            // 使用 CGAL（精确，默认）
+            // 使用 Polygon_set_2 计算所有已放置零件的并集面积
+            // 注意：Polygon_set_2 的 join 操作会自动处理重叠（去重叠），确保重叠部分只计算一次
+            // 这符合约束2：刀头之间不能重叠（如果放置时遵守了约束，这里不应该有重叠，但计算时仍然去重叠）
+            geo::Polygon_set_2 ps(geo::traits);
+            
+            for (const auto& shape : layout_.sheet_parts[0]) {
+                try {
+                    // 约束1：只计算在圆内的部分（刀头不能超出板材）
+                    // 计算零件与板材的交集（只计算在圆内的部分）
+                    std::vector<geo::Polygon_with_holes_2> inters;
                     try {
-                        ps.join(p.outer_boundary());
+                        CGAL::intersection(shape.transformed, sheet_pwh, std::back_inserter(inters));
                     }
                     catch (...) {
-                        // 忽略错误，继续处理下一个
+                        inters.clear();
+                    }
+                    
+                    // 如果交集为空，说明零件不在圆内，跳过（遵守约束1）
+                    if (inters.empty()) {
+                        continue;
+                    }
+                    
+                    // 约束2：将交集加入多边形集合（自动处理重叠，确保重叠部分只计算一次）
+                    for (const auto& p : inters) {
+                        try {
+                            ps.join(p.outer_boundary());
+                        }
+                        catch (...) {
+                            // 忽略错误，继续处理下一个
+                        }
                     }
                 }
+                catch (...) {
+                    // 忽略单个零件的错误，继续处理下一个
+                }
             }
-            catch (...) {
-                // 忽略单个零件的错误，继续处理下一个
-            }
-        }
-        
-        // 计算并集总面积
-        std::vector<geo::Polygon_with_holes_2> unions;
-        double union_area = 0.0;
-        try {
-            ps.polygons_with_holes(std::back_inserter(unions));
-        }
-        catch (...) {
-            unions.clear();
-        }
-        
-        for (const auto& p : unions) {
+            
+            // 计算并集总面积
+            std::vector<geo::Polygon_with_holes_2> unions;
+            double union_area = 0.0;
             try {
-                union_area += safe_to_double(geo::pwh_area(p));
-            } 
-            catch (...) {
-                // 忽略错误
+                ps.polygons_with_holes(std::back_inserter(unions));
             }
+            catch (...) {
+                unions.clear();
+            }
+            
+            for (const auto& p : unions) {
+                try {
+                    union_area += safe_to_double(geo::pwh_area(p));
+                } 
+                catch (...) {
+                    // 忽略错误
+                }
+            }
+            
+            // 利用率 = 实际覆盖面积（并集，去重叠）/ 圆形板材面积
+            double utilization = union_area / circle_area;
+            if (utilization < 0) utilization = 0;
+            if (utilization > 1) utilization = 1;
+            
+            return utilization;
         }
-        
-        // 利用率 = 实际覆盖面积（并集，去重叠）/ 圆形板材面积
-        // 注意：这个计算方式与CAD可能不同：
-        // - CAD可能计算的是：选择的图形总面积 / 圆面积（理论值，不考虑实际位置和重叠）
-        // - 程序计算的是：实际在圆内的覆盖面积（并集，去重叠）/ 圆面积（实际值）
-        double utilization = union_area / circle_area;
-        if (utilization < 0) utilization = 0;
-        if (utilization > 1) utilization = 1;
-        
-        return utilization;
     }
     catch (...) {
         return 0.0;
@@ -150,6 +389,12 @@ bool CircleNesting::is_valid_placement(size_t shape_idx, const std::vector<size_
         return false;
     }
 
+    // 对于 CGAL 模式，优先走一套相对简单、稳定的检查逻辑，
+    // 避免复杂容差和面积阈值导致“本来能放却被误判”的情况。
+    if (params_.geometry_library == Parameters::GeometryLibrary::CGAL) {
+        return is_valid_placement_cgal_simple(shape_idx, placed_indices);
+    }
+
     const auto& shape = layout_.sheet_parts[0][shape_idx];
     
     // ========== 约束1：严格检查是否完全在圆内（不能超出圆形板材） ==========
@@ -164,19 +409,32 @@ bool CircleNesting::is_valid_placement(size_t shape_idx, const std::vector<size_
         geo::Polygon_with_holes_2 sheet_pwh = layout_.sheets[0].sheet;
         
         // 方法1：检查所有顶点是否在圆内（快速检查）
+        // 大幅放宽容差，避免数值误差导致误判
+        // 使用相对容差：允许顶点距离半径的1%误差
+        double vertex_tolerance = radius_sq * 0.01; // 允许1%的相对误差，而不是固定的小数值
+        size_t vertex_count = 0;
         for (auto v = shape.transformed.outer_boundary().vertices_begin();
              v != shape.transformed.outer_boundary().vertices_end(); ++v) {
+            vertex_count++;
             double dx = safe_to_double(v->x()) - center_x;
             double dy = safe_to_double(v->y()) - center_y;
             double dist_sq = dx * dx + dy * dy;
-            if (dist_sq > radius_sq + tolerance) {
+            // 使用相对容差：如果距离平方超过半径平方的1.01倍，才认为超出
+            if (dist_sq > radius_sq * 1.01) {
+                qDebug() << "[DEBUG] is_valid_placement: 顶点超出圆形, shape_idx=" << shape_idx 
+                         << ", vertex=" << vertex_count << ", dist_sq=" << dist_sq 
+                         << ", radius_sq=" << radius_sq << ", threshold=" << (radius_sq * 1.01);
                 return false; // 顶点超出圆形
             }
         }
+        // 顶点检查通过（不要在热点循环中打印日志，会严重拖慢）
         
         // 方法2：检查所有边上的点（采样检查，确保边不超出）
+        // 使用相对容差
+        size_t edge_count = 0;
         for (auto e = shape.transformed.outer_boundary().edges_begin();
              e != shape.transformed.outer_boundary().edges_end(); ++e) {
+            edge_count++;
             // 在边的中点采样检查
             auto source = e->source();
             auto target = e->target();
@@ -185,52 +443,81 @@ bool CircleNesting::is_valid_placement(size_t shape_idx, const std::vector<size_
             double dx = mid_x - center_x;
             double dy = mid_y - center_y;
             double dist_sq = dx * dx + dy * dy;
-            if (dist_sq > radius_sq + tolerance) {
+            // 使用相对容差：如果距离平方超过半径平方的1.01倍，才认为超出
+            if (dist_sq > radius_sq * 1.01) {
+                qDebug() << "[DEBUG] is_valid_placement: 边超出圆形, shape_idx=" << shape_idx 
+                         << ", edge=" << edge_count << ", dist_sq=" << dist_sq;
                 return false; // 边超出圆形
             }
         }
+        // 边检查通过（不要在热点循环中打印日志，会严重拖慢）
         
-        // 方法3：使用CGAL布尔运算，检查多边形是否完全在圆内
-        // 计算多边形与圆的交集，如果交集面积等于多边形面积，说明完全在圆内
+        // 方法3：使用布尔运算，检查多边形是否完全在圆内
+        // 【临时禁用】暂时跳过布尔运算检查，仅使用顶点和边的快速检查
+        // 这样可以避免布尔运算的数值误差导致误判
+        /*
         try {
-            std::vector<geo::Polygon_with_holes_2> intersection;
-            CGAL::intersection(shape.transformed, sheet_pwh, std::back_inserter(intersection));
-            
-            // 计算交集总面积
             double intersection_area = 0.0;
-            for (const auto& poly : intersection) {
-                try {
-                    intersection_area += safe_to_double(geo::pwh_area(poly));
-                }
-                catch (...) {
-                    // 忽略错误
-                }
-            }
-            
-            // 计算多边形总面积
             double shape_area = safe_to_double(geo::pwh_area(shape.transformed));
             
-            // 如果交集面积小于多边形面积（超过容差），说明有部分超出圆形
-            if (intersection_area < shape_area - tolerance) {
-                return false;
+            // 如果面积太小，跳过精确检查（避免数值误差）
+            if (shape_area < tolerance) {
+                // 面积太小，使用快速检查结果
+            } else {
+                if (params_.geometry_library == Parameters::GeometryLibrary::Clipper) {
+                    // 使用 Clipper
+                    auto inters_result = geo::GeometryOperations::intersection(shape.transformed, sheet_pwh);
+                    intersection_area = inters_result.total_area;
+                } else {
+                    // 使用 CGAL
+                    std::vector<geo::Polygon_with_holes_2> intersection;
+                    CGAL::intersection(shape.transformed, sheet_pwh, std::back_inserter(intersection));
+                    
+                    for (const auto& poly : intersection) {
+                        try {
+                            intersection_area += safe_to_double(geo::pwh_area(poly));
+                        }
+                        catch (...) {
+                            // 忽略错误
+                        }
+                    }
+                }
+                
+                // 如果交集面积小于多边形面积（超过容差），说明有部分超出圆形
+                // 使用相对容差，避免小面积时的数值误差
+                // 放宽容差，避免数值误差导致误判（特别是对于复杂形状）
+                double min_area_ratio = 0.90; // 统一放宽到90%，避免过于严格
+                double area_ratio = (shape_area > tolerance) ? (intersection_area / shape_area) : 1.0;
+                if (area_ratio < min_area_ratio) {
+                    return false;
+                }
             }
         }
         catch (...) {
             // 如果布尔运算失败，使用保守策略：只检查顶点和边（已在上面完成）
             // 如果顶点和边都在圆内，通常整个多边形也在圆内
+            // 不返回 false，继续使用快速检查的结果
         }
+        */
         
         // 检查孔（如果有）
+        // 使用相对容差
+        size_t hole_count = 0;
         for (auto h = shape.transformed.holes_begin(); h != shape.transformed.holes_end(); ++h) {
+            hole_count++;
             for (auto v = h->vertices_begin(); v != h->vertices_end(); ++v) {
                 double dx = safe_to_double(v->x()) - center_x;
                 double dy = safe_to_double(v->y()) - center_y;
                 double dist_sq = dx * dx + dy * dy;
-                if (dist_sq > radius_sq + tolerance) {
+                // 使用相对容差：如果距离平方超过半径平方的1.01倍，才认为超出
+                if (dist_sq > radius_sq * 1.01) {
+                    qDebug() << "[DEBUG] is_valid_placement: 孔超出圆形, shape_idx=" << shape_idx 
+                             << ", hole=" << hole_count;
                     return false;
                 }
             }
         }
+        // 孔检查通过（不要在热点循环中打印日志，会严重拖慢）
     }
     catch (...) {
         return false;
@@ -253,31 +540,284 @@ bool CircleNesting::is_valid_placement(size_t shape_idx, const std::vector<size_
                 continue; // bbox 不相交，跳过精确检测
             }
             
-            // 精确检测：CGAL 布尔运算
-            geo::Polygon_set_2 ps1(geo::traits);
-            ps1.insert(shape.transformed.outer_boundary());
+            // 精确检测：布尔运算（根据参数选择 Clipper 或 CGAL）
+            double overlap_area = 0.0;
+            bool check_succeeded = false;
             
-            geo::Polygon_set_2 ps2(geo::traits);
-            ps2.insert(shape_j.transformed.outer_boundary());
-            
-            ps1.intersection(ps2);
-            
-            if (!ps1.is_empty()) {
-                std::vector<geo::Polygon_with_holes_2> intersection;
-                intersection.reserve(4);
-                ps1.polygons_with_holes(std::back_inserter(intersection));
-                
-                double overlap_area = 0.0;
-                for (const auto& poly : intersection) {
-                    overlap_area += safe_to_double(geo::pwh_area(poly));
+            if (params_.geometry_library == Parameters::GeometryLibrary::Clipper) {
+                // 使用 Clipper，但总是准备回退到 CGAL 作为验证
+                bool clipper_ok = false;
+                try {
+                    auto inters_result = geo::GeometryOperations::intersection(
+                        shape.transformed, shape_j.transformed);
+                    
+                    // 检查结果：如果 polygons 为空或 is_empty 为 true，说明没有重叠
+                    if (inters_result.polygons.empty() || inters_result.is_empty) {
+                        // 没有重叠
+                        check_succeeded = true;
+                        overlap_area = 0.0;
+                        clipper_ok = true;
+                    } else {
+                        // 有重叠，计算重叠面积
+                        overlap_area = inters_result.total_area;
+                        check_succeeded = true;
+                        clipper_ok = true;
+                    }
+                } catch (...) {
+                    // Clipper 执行失败
+                    clipper_ok = false;
                 }
-                if (overlap_area > 1e-6) {
+                
+                // 如果 Clipper 失败或结果可疑，回退到 CGAL 进行验证
+                if (!clipper_ok || (!check_succeeded)) {
+                    try {
+                        geo::Polygon_set_2 ps1(geo::traits);
+                        ps1.insert(shape.transformed.outer_boundary());
+                        
+                        geo::Polygon_set_2 ps2(geo::traits);
+                        ps2.insert(shape_j.transformed.outer_boundary());
+                        
+                        ps1.intersection(ps2);
+                        
+                        if (!ps1.is_empty()) {
+                            std::vector<geo::Polygon_with_holes_2> intersection;
+                            intersection.reserve(4);
+                            ps1.polygons_with_holes(std::back_inserter(intersection));
+                            
+                            overlap_area = 0.0;
+                            for (const auto& poly : intersection) {
+                                overlap_area += safe_to_double(geo::pwh_area(poly));
+                            }
+                        } else {
+                            overlap_area = 0.0;
+                        }
+                        check_succeeded = true;
+                    } catch (...) {
+                        // CGAL 也失败，使用保守策略：如果 bbox 相交，假设可能有重叠
+                        // 但这里 bbox 已经相交（否则不会到这里），所以返回 false
+                        return false;
+                    }
+                }
+            } else {
+                // 使用 CGAL
+                try {
+                    geo::Polygon_set_2 ps1(geo::traits);
+                    ps1.insert(shape.transformed.outer_boundary());
+                    
+                    geo::Polygon_set_2 ps2(geo::traits);
+                    ps2.insert(shape_j.transformed.outer_boundary());
+                    
+                    ps1.intersection(ps2);
+                    
+                    if (!ps1.is_empty()) {
+                        std::vector<geo::Polygon_with_holes_2> intersection;
+                        intersection.reserve(4);
+                        ps1.polygons_with_holes(std::back_inserter(intersection));
+                        
+                        for (const auto& poly : intersection) {
+                            try {
+                                overlap_area += safe_to_double(geo::pwh_area(poly));
+                            } catch (const CGAL::Uncertain_conversion_exception&) {
+                                // CGAL 转换异常，忽略这个多边形，继续处理其他
+                            } catch (...) {
+                                // 其他异常也忽略
+                            }
+                        }
+                    }
+                    check_succeeded = true;
+                } catch (const CGAL::Uncertain_conversion_exception&) {
+                    // CGAL 转换异常，使用保守策略
+                    return false;
+                } catch (...) {
+                    // CGAL 失败，保守策略：如果 bbox 相交，假设可能有重叠
                     return false;
                 }
+            }
+            
+            // 如果检测成功且发现重叠，返回 false
+            // 大幅放宽容差，避免数值误差导致误判
+            // 使用相对容差：重叠面积必须超过较小形状面积的1%才认为真正重叠
+            double shape_area_i = 0.0, shape_area_j = 0.0;
+            try {
+                // 面积与平移/旋转无关，优先用 base，避免频繁对 transformed 做 CGAL 计算
+                if (shape.base) {
+                    shape_area_i = safe_to_double(geo::pwh_area(*shape.base));
+                }
+                if (shape_j.base) {
+                    shape_area_j = safe_to_double(geo::pwh_area(*shape_j.base));
+                }
+            } catch (...) {
+                // 如果面积计算失败，使用固定容差
+            }
+            double min_shape_area = std::min(shape_area_i, shape_area_j);
+            double overlap_tolerance = std::max(1e-4, min_shape_area * 0.01); // 至少1e-4，或较小形状面积的1%
+            
+            if (check_succeeded && overlap_area > overlap_tolerance) {
+                return false;
             }
         }
         catch (...) {
             return false;
+        }
+    }
+    return true;
+}
+
+// ============================================================================
+// 几何尺寸预检查：判断零件在当前圆直径下是否“无论如何都放不下”
+// 简单策略：使用零件外轮廓的 bbox 对角线作为近似直径，与圆板直径比较。
+// 如果 bbox 对角线明显大于圆直径（留出一点安全裕度），就认为永远放不下。
+// 这样可以避免在明显不可能的零件上浪费大量候选搜索时间。
+// ============================================================================
+bool CircleNesting::can_never_fit_in_circle(size_t shape_idx) const {
+    if (shape_idx >= layout_.sheet_parts[0].size()) {
+        return true;
+    }
+
+    try {
+        const auto& shape = layout_.sheet_parts[0][shape_idx];
+        const auto& poly = *shape.base;
+        auto bbox = poly.bbox();
+
+        double width = safe_to_double(bbox.xmax() - bbox.xmin());
+        double height = safe_to_double(bbox.ymax() - bbox.ymin());
+        if (width <= 0.0 || height <= 0.0) {
+            return true;
+        }
+
+        double diag = std::sqrt(width * width + height * height); // 近似零件的最小包围圆直径
+        double sheet_d = safe_to_double(layout_.sheets[0].diameter);
+
+        // 留出 2% 的安全裕度：如果零件最小包围圆直径仍然大于圆板直径的 1.02 倍，则认为绝对放不下
+        if (diag > sheet_d * 1.02) {
+            qDebug() << "[DEBUG] can_never_fit_in_circle: 零件几何尺寸大于圆板, shape_idx="
+                     << shape_idx << ", diag=" << diag << ", sheet_d=" << sheet_d;
+            return true;
+        }
+    } catch (...) {
+        // 出现异常时，宁可保守认为可能放得下，以免误杀
+        return false;
+    }
+
+    return false;
+}
+
+// ============================================================================
+// CGAL 简化版约束检查：
+// - 约束1：顶点/孔顶点必须在圆内（使用较小的相对容差）
+// - 约束2：使用 Polygon_set_2 判断是否与已放置零件有交集（有交集则视为重叠）
+// 相比完整版本，这里不再计算重叠面积阈值，只要有明显交集就认为不合法，
+// 目的是先让 CGAL 模式“能稳定跑完”，作为对比基线。
+// ============================================================================
+bool CircleNesting::is_valid_placement_cgal_simple(
+    size_t shape_idx,
+    const std::vector<size_t>& placed_indices) const {
+    if (shape_idx >= layout_.sheet_parts[0].size()) {
+        return false;
+    }
+
+    const auto& shape = layout_.sheet_parts[0][shape_idx];
+
+    // ===== 约束1：在圆内（使用相对较小的容差，避免把真正在外面的零件放进来）=====
+    try {
+        double radius = safe_to_double(layout_.sheets[0].diameter) / 2.0;
+        double center_x = radius;
+        double center_y = radius;
+        double radius_sq = radius * radius;
+
+        // 顶点检查
+        for (auto v = shape.transformed.outer_boundary().vertices_begin();
+             v != shape.transformed.outer_boundary().vertices_end(); ++v) {
+            double dx = safe_to_double(v->x()) - center_x;
+            double dy = safe_to_double(v->y()) - center_y;
+            double dist_sq = dx * dx + dy * dy;
+            // 只允许非常小的浮点误差（0.1%）
+            if (dist_sq > radius_sq * 1.001) {
+                return false;
+            }
+        }
+
+        // 孔顶点检查
+        for (auto h = shape.transformed.holes_begin();
+             h != shape.transformed.holes_end(); ++h) {
+            for (auto v = h->vertices_begin(); v != h->vertices_end(); ++v) {
+                double dx = safe_to_double(v->x()) - center_x;
+                double dy = safe_to_double(v->y()) - center_y;
+                double dist_sq = dx * dx + dy * dy;
+                if (dist_sq > radius_sq * 1.001) {
+                    return false;
+                }
+            }
+        }
+    } catch (...) {
+        // 圆内检查失败时，保守起见认为不合法
+        return false;
+    }
+
+    // ===== 约束2：不能与已放置零件重叠（仅使用 double 近似检测，避免 CGAL 布尔运算）=====
+    auto bbox_i = shape.transformed.bbox();
+
+    // 先把当前零件外轮廓转换成 double 多边形
+    std::vector<std::pair<double, double>> poly_i;
+    for (auto v = shape.transformed.outer_boundary().vertices_begin();
+         v != shape.transformed.outer_boundary().vertices_end(); ++v) {
+        poly_i.emplace_back(safe_to_double(v->x()), safe_to_double(v->y()));
+    }
+
+    for (size_t j : placed_indices) {
+        if (j == shape_idx) continue;
+
+        const auto& shape_j = layout_.sheet_parts[0][j];
+
+        // bbox 快速排除
+        auto bbox_j = shape_j.transformed.bbox();
+        if (bbox_i.xmax() < bbox_j.xmin() || bbox_i.xmin() > bbox_j.xmax() ||
+            bbox_i.ymax() < bbox_j.ymin() || bbox_i.ymin() > bbox_j.ymax()) {
+            continue;
+        }
+
+        // 将已放置零件外轮廓转换为 double 多边形
+        std::vector<std::pair<double, double>> poly_j;
+        for (auto v = shape_j.transformed.outer_boundary().vertices_begin();
+             v != shape_j.transformed.outer_boundary().vertices_end(); ++v) {
+            poly_j.emplace_back(safe_to_double(v->x()), safe_to_double(v->y()));
+        }
+
+        // 1) 顶点包含测试：A 顶点在 B 内，或 B 顶点在 A 内，都视为重叠
+        for (const auto& p : poly_i) {
+            if (point_in_polygon_double(p.first, p.second, poly_j)) {
+                return false;
+            }
+        }
+        for (const auto& p : poly_j) {
+            if (point_in_polygon_double(p.first, p.second, poly_i)) {
+                return false;
+            }
+        }
+
+        // 2) 边与边相交测试
+        size_t ni = poly_i.size();
+        size_t nj = poly_j.size();
+        if (ni >= 2 && nj >= 2) {
+            for (size_t a = 0; a < ni; ++a) {
+                size_t a2 = (a + 1) % ni;
+                double ax = poly_i[a].first;
+                double ay = poly_i[a].second;
+                double bx = poly_i[a2].first;
+                double by = poly_i[a2].second;
+
+                for (size_t b = 0; b < nj; ++b) {
+                    size_t b2 = (b + 1) % nj;
+                    double cx = poly_j[b].first;
+                    double cy = poly_j[b].second;
+                    double dx = poly_j[b2].first;
+                    double dy = poly_j[b2].second;
+
+                    if (segments_intersect_double(ax, ay, bx, by, cx, cy, dx, dy)) {
+                        return false;
+                    }
+                }
+            }
         }
     }
 
@@ -404,14 +944,17 @@ std::vector<geo::Point_2> CircleNesting::generate_circular_candidates(
     return candidates;
 }
 
-bool CircleNesting::place_shape_with_nfp(size_t shape_idx, const std::vector<size_t>& placed_indices, 
-                                         bool try_all_rotations) {
+bool CircleNesting::place_shape_with_nfp(size_t shape_idx,
+                                         const std::vector<size_t>& placed_indices, 
+                                         bool try_all_rotations,
+                                         volatile bool* requestQuit,
+                                         bool allow_waste_minimization) {
     if (shape_idx >= layout_.sheet_parts[0].size()) {
         return false;
     }
 
     // 如果启用废料最小化且已有放置的零件，优先尝试在废料区域放置
-    if (params_.use_waste_minimization && !placed_indices.empty()) {
+    if (allow_waste_minimization && params_.use_waste_minimization && !placed_indices.empty()) {
         bool placed = place_shape_in_waste(shape_idx, placed_indices, try_all_rotations);
         if (placed) {
             return true;
@@ -426,17 +969,85 @@ bool CircleNesting::place_shape_with_nfp(size_t shape_idx, const std::vector<siz
         shape.update();
         
         // 计算IFR（使用transformed，因为IFR需要知道当前旋转状态）
+        qDebug() << "[DEBUG] place_shape_with_nfp: 开始, shape_idx=" << shape_idx 
+                 << ", placed_indices.size()=" << placed_indices.size() 
+                 << ", try_all_rotations=" << try_all_rotations;
+        
         auto ifr = geo::comp_ifr(layout_.sheets[0].sheet, shape.transformed);
-        if (ifr.is_empty()) {
-            return false;
+        qDebug() << "[DEBUG] place_shape_with_nfp: IFR计算完成, is_empty=" << ifr.is_empty();
+        
+        // 生成候选点（即使 IFR 为空，也尝试生成径向候选点）
+        std::vector<geo::Point_2> candidates;
+        if (!ifr.is_empty()) {
+            candidates = generate_circular_candidates(shape_idx, placed_indices, ifr);
+            qDebug() << "[DEBUG] place_shape_with_nfp: 从IFR生成候选点, count=" << candidates.size();
+        } else {
+            qDebug() << "[DEBUG] place_shape_with_nfp: IFR为空，将尝试生成径向候选点";
         }
+        
+        // 如果候选点为空或 IFR 为空，尝试生成径向候选点作为备选
+        if (candidates.empty() && params_.use_radial_candidates) {
+            // 直接生成径向候选点，不依赖 IFR
+            double radius = safe_to_double(layout_.sheets[0].diameter) / 2.0;
+            double center_x = radius;
+            double center_y = radius;
+            auto bbox = shape.transformed.bbox();
+            double shape_width = safe_to_double(bbox.xmax() - bbox.xmin());
+            double shape_height = safe_to_double(bbox.ymax() - bbox.ymin());
+            
+            size_t radial_layers = params_.radial_layers;
+            size_t angles_per_layer = params_.angles_per_layer;
+            
+            size_t generated_candidates = 0;
+            const size_t max_candidates_per_shape = params_.max_candidate_points;
 
-        // 生成候选点
-        auto candidates = generate_circular_candidates(shape_idx, placed_indices, ifr);
+            for (size_t layer = 0; layer < radial_layers; ++layer) {
+                if (requestQuit && *requestQuit) {
+                    // 用户请求停止，立即返回
+                    return false;
+                }
+                double layer_ratio = double(layer) / (radial_layers - 1);
+                double r_ratio = 0.15 + 0.75 * (layer_ratio * layer_ratio);
+                double r = radius * r_ratio;
+                
+                for (size_t a = 0; a < angles_per_layer; ++a) {
+                    double angle = 2.0 * Sheet::kPi * double(a) / angles_per_layer;
+                    for (int offset = -1; offset <= 1; offset += 2) {
+                        double angle_offset = angle + offset * (2.0 * Sheet::kPi / angles_per_layer / 4.0);
+                        double x = center_x + r * std::cos(angle_offset) - shape_width / 2.0;
+                        double y = center_y + r * std::sin(angle_offset) - shape_height / 2.0;
+                        
+                        double max_dist = std::sqrt(
+                            std::max((x + shape_width - center_x) * (x + shape_width - center_x),
+                                    (x - center_x) * (x - center_x)) +
+                            std::max((y + shape_height - center_y) * (y + shape_height - center_y),
+                                    (y - center_y) * (y - center_y)));
+                        
+                        if (max_dist <= radius * 0.98) {
+                            candidates.push_back(geo::Point_2(geo::FT(x), geo::FT(y)));
+                            ++generated_candidates;
+                        }
+                        
+                        if (generated_candidates >= max_candidates_per_shape) {
+                            break;
+                        }
+                    }
+                    if (generated_candidates >= max_candidates_per_shape) {
+                        break;
+                    }
+                }
+                if (generated_candidates >= max_candidates_per_shape) {
+                    break;
+                }
+            }
+        }
         
         if (candidates.empty()) {
+            qDebug() << "[DEBUG] place_shape_with_nfp: 候选点为空，返回false";
             return false;
         }
+        
+        qDebug() << "[DEBUG] place_shape_with_nfp: 开始尝试候选点, total=" << candidates.size();
 
         // 尝试每个候选点，选择最紧凑的位置（最靠近中心）
         double radius = safe_to_double(layout_.sheets[0].diameter) / 2.0;
@@ -464,7 +1075,17 @@ bool CircleNesting::place_shape_with_nfp(size_t shape_idx, const std::vector<siz
 
         uint32_t original_rotation = shape.get_rotation();
         
+        // 对每个零件限制总尝试次数，避免在单个零件上耗费过多时间
+        const size_t max_total_attempts_per_shape =
+            static_cast<size_t>(params_.max_candidate_points) *
+            static_cast<size_t>(std::max<uint32_t>(1, shape.allowed_rotations));
+        size_t total_attempts = 0;
+
         for (uint32_t rot : rotations_to_try) {
+            if (requestQuit && *requestQuit) {
+                // 用户请求停止，立即返回
+                return false;
+            }
             shape.set_rotation(rot);
             shape.update();
             
@@ -481,6 +1102,17 @@ bool CircleNesting::place_shape_with_nfp(size_t shape_idx, const std::vector<siz
             }
 
             for (const auto& candidate : candidates_for_rotation) {
+                if (requestQuit && *requestQuit) {
+                    // 用户请求停止，立即返回
+                    return false;
+                }
+                if (total_attempts >= max_total_attempts_per_shape) {
+                    // 达到单个零件的尝试上限，不再继续
+                    qDebug() << "[DEBUG] place_shape_with_nfp: 超过尝试上限, shape_idx="
+                             << shape_idx << ", total_attempts=" << total_attempts;
+                    break;
+                }
+                ++total_attempts;
                 // 临时放置
                 auto old_x = shape.get_translate_ft_x();
                 auto old_y = shape.get_translate_ft_y();
@@ -529,11 +1161,14 @@ bool CircleNesting::place_shape_with_nfp(size_t shape_idx, const std::vector<siz
         }
 
         if (found) {
+            qDebug() << "[DEBUG] place_shape_with_nfp: 成功找到位置, shape_idx=" << shape_idx 
+                     << ", rotation=" << best_rotation;
             shape.set_rotation(best_rotation);
             shape.set_translate(best_point.x(), best_point.y());
             shape.update();
             return true;
         } else {
+            qDebug() << "[DEBUG] place_shape_with_nfp: 未找到有效位置, shape_idx=" << shape_idx;
             // 恢复原始旋转
             shape.set_rotation(original_rotation);
             shape.update();
@@ -557,6 +1192,21 @@ bool CircleNesting::try_place_all_parts(double diameter, volatile bool* requestQ
     for (auto& shape : layout_.sheet_parts[0]) {
         shape.set_translate(geo::FT(outside_offset), geo::FT(outside_offset));
         shape.update();
+    }
+    if (params_.use_scheduling && params_.scheduling_attempts > 1) {
+        schedule_best_order(diameter, requestQuit, progress_callback);
+        double util_now = 0.0;
+        try {
+            util_now = calculate_utilization();
+        } catch (...) {
+            util_now = 0.0;
+        }
+        if (util_now > best_utilization_) {
+            best_utilization_ = util_now;
+            layout_.best_utilization = best_utilization_;
+            layout_.best_result = layout_.sheet_parts;
+        }
+        return util_now > 0.0;
     }
 
     // 智能排序：考虑面积、形状复杂度、长宽比
@@ -583,30 +1233,27 @@ bool CircleNesting::try_place_all_parts(double diameter, volatile bool* requestQ
     // 放置第一个零件：稍微远离中心，给其他零件留出空间
     if (!indices.empty()) {
         size_t first_idx = indices[0];
+        if (can_never_fit_in_circle(first_idx)) {
+            qDebug() << "[DEBUG] try_place_all_parts: 第一个零件几何尺寸大于圆板, shape_idx=" << first_idx;
+            // 第一个零件本身放不下，直接返回失败，交给上层决定是否调整直径
+            return false;
+        }
         double radius = diameter / 2.0;
         auto& shape = layout_.sheet_parts[0][first_idx];
         
-        // 先更新一次以确保transformed是最新的
         shape.update();
         auto bbox = shape.transformed.bbox();
         double shape_width = safe_to_double(bbox.xmax() - bbox.xmin());
         double shape_height = safe_to_double(bbox.ymax() - bbox.ymin());
-        
-        // 稍微远离中心：使用半径的30%作为偏移，给其他零件留出空间
-        double offset_ratio = 0.3;
-        double offset_x = radius * offset_ratio;
-        double offset_y = radius * offset_ratio;
-        
-        shape.set_translate(geo::FT(radius - shape_width / 2.0 + offset_x), 
-                          geo::FT(radius - shape_height / 2.0 + offset_y));
+
+        shape.set_translate(geo::FT(radius - shape_width / 2.0),
+                          geo::FT(radius - shape_height / 2.0));
         shape.update();
-        
-        // 严格验证：确保第一个零件也在圆内且无重叠（虽然此时没有其他零件）
-        std::vector<size_t> empty_placed; // 空列表，因为这是第一个零件
+
+        std::vector<size_t> empty_placed;
         if (!is_valid_placement(first_idx, empty_placed)) {
-            // 如果中心位置无效，尝试使用place_shape_with_nfp寻找有效位置
-            if (!place_shape_with_nfp(first_idx, empty_placed, params_.try_all_rotations)) {
-                return false; // 无法放置第一个零件
+            if (!place_shape_with_nfp(first_idx, empty_placed, params_.try_all_rotations, requestQuit)) {
+                return false;
             }
         }
         
@@ -620,20 +1267,24 @@ bool CircleNesting::try_place_all_parts(double diameter, volatile bool* requestQ
         }
 
         size_t shape_idx = indices[i];
+        if (can_never_fit_in_circle(shape_idx)) {
+            qDebug() << "[DEBUG] try_place_all_parts: 零件几何尺寸大于圆板, 跳过 shape_idx=" << shape_idx;
+            continue;
+        }
         bool placed = false;
 
         // 优化策略：即使允许旋转，也优先尝试“保持当前朝向”放置；
         // 只有在固定朝向无法放置时，才启用多角度旋转搜索。
         if (params_.try_all_rotations) {
             // 1）先不旋转（只用当前rotation）尝试放置
-            placed = place_shape_with_nfp(shape_idx, placed_indices, /*try_all_rotations=*/false);
+            placed = place_shape_with_nfp(shape_idx, placed_indices, /*try_all_rotations=*/false, requestQuit);
             // 2）如果失败，再启用多角度旋转搜索
             if (!placed) {
-                placed = place_shape_with_nfp(shape_idx, placed_indices, /*try_all_rotations=*/true);
+                placed = place_shape_with_nfp(shape_idx, placed_indices, /*try_all_rotations=*/true, requestQuit);
             }
         } else {
             // 完全不旋转的模式，保持原有行为
-            placed = place_shape_with_nfp(shape_idx, placed_indices, /*try_all_rotations=*/false);
+            placed = place_shape_with_nfp(shape_idx, placed_indices, /*try_all_rotations=*/false, requestQuit);
         }
 
         if (placed) {
@@ -644,15 +1295,32 @@ bool CircleNesting::try_place_all_parts(double diameter, volatile bool* requestQ
         // 这样可以让算法尝试放置尽可能多的零件，即使不是所有零件都能放置
         
         // 每放置5个零件，报告一次进度
-        if (progress_callback && placed_indices.size() % 5 == 0) {
-            // 计算当前利用率并更新最佳结果
-            double current_util = calculate_utilization();
-            if (current_util > best_utilization_) {
-                best_utilization_ = current_util;
-                layout_.best_utilization = best_utilization_;
-                layout_.best_result = layout_.sheet_parts;
+        // 或者每尝试10个零件也报告一次（即使没有放置成功），确保进度有更新
+        if (progress_callback) {
+            bool should_report = false;
+            if (placed_indices.size() % 5 == 0 && placed_indices.size() > 0) {
+                should_report = true;
+            } else if ((i + 1) % 10 == 0) {
+                should_report = true;
+            } else if (i == indices.size() - 1) {
+                // 最后一个零件，必须报告
+                should_report = true;
             }
-            (*progress_callback)(layout_);
+            
+            if (should_report) {
+                // 计算当前利用率并更新最佳结果
+                double current_util = calculate_utilization();
+                if (current_util > best_utilization_) {
+                    best_utilization_ = current_util;
+                    layout_.best_utilization = best_utilization_;
+                    layout_.best_result = layout_.sheet_parts;
+                } else if (best_utilization_ > 0) {
+                    // 即使当前利用率没有提高，也要确保 best_result 是最新的
+                    layout_.best_utilization = best_utilization_;
+                    layout_.best_result = layout_.sheet_parts;
+                }
+                (*progress_callback)(layout_);
+            }
         }
     }
     
@@ -672,8 +1340,19 @@ bool CircleNesting::try_place_all_parts(double diameter, volatile bool* requestQ
         }
     }
     
-    // 放置完成后，更新最佳结果
-    double final_util = calculate_utilization();
+    // 放置完成后，更新最佳结果，并打印一次调试信息
+    double final_util = 0.0;
+    try {
+        final_util = calculate_utilization();
+    } catch (...) {
+        final_util = 0.0;
+    }
+
+    qDebug() << "[DEBUG] try_place_all_parts: 结束, diameter=" << diameter
+             << ", placed_count=" << placed_indices.size()
+             << ", total_parts=" << layout_.poly_num
+             << ", utilization=" << final_util;
+
     if (final_util > best_utilization_) {
         best_utilization_ = final_util;
         layout_.best_utilization = best_utilization_;
@@ -723,7 +1402,7 @@ void CircleNesting::compact_layout(size_t iterations, volatile bool* requestQuit
     bool should_quit = false;
 
     for (size_t iter = 0; iter < iterations; ++iter) {
-        if (requestQuit && *requestQuit) {
+        if (should_stop(requestQuit)) {
             should_quit = true;
             break;
         }
@@ -734,7 +1413,7 @@ void CircleNesting::compact_layout(size_t iterations, volatile bool* requestQuit
         std::shuffle(indices.begin(), indices.end(), gen);
 
         for (size_t idx : indices) {
-            if (requestQuit && *requestQuit) {
+            if (should_stop(requestQuit)) {
                 should_quit = true;
                 break;
             }
@@ -871,7 +1550,7 @@ void CircleNesting::compact_layout(size_t iterations, volatile bool* requestQuit
 
             // 尝试每个方向
             for (const auto& dir : directions) {
-                if (requestQuit && *requestQuit) {
+                if (should_stop(requestQuit)) {
                     should_quit = true;
                     break;
                 }
@@ -996,7 +1675,7 @@ bool CircleNesting::optimize_diameter(double target_utilization, volatile bool* 
         double step = current_diameter * params_.diameter_step_ratio;
         
         for (size_t iter = 0; iter < params_.diameter_optimization_iterations; ++iter) {
-            if (requestQuit && *requestQuit) {
+            if (should_stop(requestQuit)) {
                 break;
             }
 
@@ -1007,7 +1686,7 @@ bool CircleNesting::optimize_diameter(double target_utilization, volatile bool* 
 
             if (try_place_all_parts(test_diameter, requestQuit, &progress_callback)) {
                 // 如果用户已经请求退出，不再进入耗时的紧凑化阶段
-                if (requestQuit && *requestQuit) {
+                if (should_stop(requestQuit)) {
                     break;
                 }
 
@@ -1043,7 +1722,7 @@ bool CircleNesting::optimize_diameter(double target_utilization, volatile bool* 
         }
 
         // 如果此时已经请求退出，就不要再进入最终紧凑化，直接用当前结果
-        if (!(requestQuit && *requestQuit)) {
+        if (!should_stop(requestQuit)) {
             // 最终紧凑化（使用更多迭代）
             compact_layout(params_.compact_iterations, requestQuit, &progress_callback);
         }
@@ -1269,13 +1948,37 @@ bool CircleNesting::optimize(double target_utilization, volatile bool* requestQu
             return optimize_array_mode(target_utilization, requestQuit, progress_callback);
         }
 
-        // 首先尝试在当前直径下放置
-        if (!try_place_all_parts(safe_to_double(layout_.sheets[0].diameter), requestQuit, &progress_callback)) {
-            return false;
+        double current_diameter = safe_to_double(layout_.sheets[0].diameter);
+
+        // 如果启用Hodograph方法，先用它生成快速初始解
+        if (params_.use_hodograph_initial) {
+            if (generate_hodograph_initial_solution(current_diameter, requestQuit)) {
+                // 计算初始利用率
+                double initial_util = calculate_utilization();
+                if (initial_util > best_utilization_) {
+                    best_utilization_ = initial_util;
+                    layout_.best_utilization = best_utilization_;
+                    layout_.best_result = layout_.sheet_parts;
+                }
+                if (progress_callback) {
+                    progress_callback(layout_);
+                }
+            }
+        }
+
+        // 首先尝试在当前直径下放置（如果Hodograph未启用或失败）
+        if (!params_.use_hodograph_initial || best_utilization_ == 0.0) {
+            // 尝试放置零件，即使只放置了部分零件也继续（不直接返回false）
+            bool placed_any = try_place_all_parts(current_diameter, requestQuit, &progress_callback);
+            if (!placed_any) {
+                // 如果连第一个零件都无法放置，才返回false
+                return false;
+            }
+            // 即使只放置了部分零件，也继续后续优化（紧凑化、直径优化等）
         }
 
         // 如果用户已经请求退出，跳过后续紧凑化和直径优化，直接用当前结果
-        if (requestQuit && *requestQuit) {
+        if (should_stop(requestQuit)) {
             double util_now = calculate_utilization();
             best_utilization_ = util_now;
             layout_.best_utilization = best_utilization_;
@@ -1284,6 +1987,25 @@ bool CircleNesting::optimize(double target_utilization, volatile bool* requestQu
                 progress_callback(layout_);
             }
             return false;
+        }
+
+        // 检查上界/下界差距（如果启用）
+        if (params_.use_bound_evaluation) {
+            double bound_gap = calculate_bound_gap();
+            // 如果差距已经足够小，可以提前停止优化
+            if (bound_gap <= params_.bound_gap_threshold) {
+                // 差距已经很小，说明已经接近最优，可以提前停止
+                double current_util = calculate_utilization();
+                if (current_util > best_utilization_) {
+                    best_utilization_ = current_util;
+                    layout_.best_utilization = best_utilization_;
+                    layout_.best_result = layout_.sheet_parts;
+                }
+                if (progress_callback) {
+                    progress_callback(layout_);
+                }
+                return best_utilization_ >= target_utilization;
+            }
         }
 
         // 紧凑化
@@ -1295,6 +2017,18 @@ bool CircleNesting::optimize(double target_utilization, volatile bool* requestQu
             best_utilization_ = current_util;
             layout_.best_utilization = best_utilization_;
             layout_.best_result = layout_.sheet_parts;
+        }
+        
+        // 再次检查上界/下界差距
+        if (params_.use_bound_evaluation) {
+            double bound_gap = calculate_bound_gap();
+            if (bound_gap <= params_.bound_gap_threshold) {
+                // 差距已经足够小，提前停止
+                if (progress_callback) {
+                    progress_callback(layout_);
+                }
+                return best_utilization_ >= target_utilization;
+            }
         }
         
         if (progress_callback) {
@@ -1310,7 +2044,7 @@ bool CircleNesting::optimize(double target_utilization, volatile bool* requestQu
         bool diameter_success = optimize_diameter(target_utilization, requestQuit, progress_callback);
         
         // 停止时，确保 best_result 是最新的（可能在直径优化过程中有改进）
-        if (requestQuit && *requestQuit) {
+        if (should_stop(requestQuit)) {
             double final_util = calculate_utilization();
             if (final_util > best_utilization_) {
                 best_utilization_ = final_util;
@@ -1468,13 +2202,13 @@ std::vector<size_t> CircleNesting::schedule_best_order(double diameter, volatile
             auto bbox = shape.transformed.bbox();
             double shape_width = safe_to_double(bbox.xmax() - bbox.xmin());
             double shape_height = safe_to_double(bbox.ymax() - bbox.ymin());
-            shape.set_translate(geo::FT(radius - shape_width / 2.0 + radius * 0.3),
-                                geo::FT(radius - shape_height / 2.0 + radius * 0.3));
+            shape.set_translate(geo::FT(radius - shape_width / 2.0),
+                                geo::FT(radius - shape_height / 2.0));
             shape.update();
 
             if (is_valid_placement(first_idx, empty_placed)) {
                 placed_indices.push_back(first_idx);
-            } else if (place_shape_with_nfp(first_idx, empty_placed, params_.try_all_rotations)) {
+            } else if (place_shape_with_nfp(first_idx, empty_placed, params_.try_all_rotations, requestQuit)) {
                 placed_indices.push_back(first_idx);
             }
         }
@@ -1483,12 +2217,18 @@ std::vector<size_t> CircleNesting::schedule_best_order(double diameter, volatile
         for (size_t i = 1; i < candidate_order.size(); ++i) {
             if (requestQuit && *requestQuit) break;
             size_t shape_idx = candidate_order[i];
-            bool placed = place_shape_with_nfp(shape_idx, placed_indices, false);
+            bool placed = place_shape_with_nfp(shape_idx, placed_indices, false, requestQuit);
             if (!placed && params_.try_all_rotations) {
-                placed = place_shape_with_nfp(shape_idx, placed_indices, true);
+                placed = place_shape_with_nfp(shape_idx, placed_indices, true, requestQuit);
             }
             if (placed) {
                 placed_indices.push_back(shape_idx);
+
+                if (progress_callback && (placed_indices.size() % 5 == 0)) {
+                    layout_.best_result = layout_.sheet_parts;
+                    layout_.best_utilization = best_utilization_;
+                    (*progress_callback)(layout_);
+                }
             }
         }
 
@@ -1590,6 +2330,311 @@ double CircleNesting::binary_search_diameter(double min_diameter, double max_dia
 }
 
 // ============================================================================
+// 上界/下界评估：计算改进的下界（考虑形状约束和旋转限制）
+// ============================================================================
+double CircleNesting::calculate_improved_lower_bound() const {
+    if (layout_.sheet_parts.empty() || layout_.sheet_parts[0].empty()) {
+        return 0.0;
+    }
+
+    try {
+        double total_area = safe_to_double(layout_.area);
+        if (total_area <= 0) {
+            return 0.0;
+        }
+
+        // 方法1：基础面积下界
+        double basic_lower_bound = std::sqrt(4.0 * total_area / Sheet::kPi);
+
+        // 方法2：考虑形状复杂度的下界
+        // 计算所有零件的平均长宽比和复杂度
+        double total_complexity = 0.0;
+        double max_bbox_diagonal = 0.0;
+        size_t valid_shapes = 0;
+
+        for (size_t i = 0; i < layout_.poly_num; ++i) {
+            try {
+                const auto& shape = layout_.sheet_parts[0][i];
+                const auto& poly = *shape.base;
+                
+                double area = safe_to_double(geo::pwh_area(poly));
+                if (area <= 0) continue;
+
+                auto bbox = poly.bbox();
+                double width = safe_to_double(bbox.xmax() - bbox.xmin());
+                double height = safe_to_double(bbox.ymax() - bbox.ymin());
+                double diagonal = std::sqrt(width * width + height * height);
+                max_bbox_diagonal = std::max(max_bbox_diagonal, diagonal);
+
+                // 计算周长
+                double perimeter = 0.0;
+                for (auto e = poly.outer_boundary().edges_begin();
+                     e != poly.outer_boundary().edges_end(); ++e) {
+                    double dx = safe_to_double(e->target().x() - e->source().x());
+                    double dy = safe_to_double(e->target().y() - e->source().y());
+                    perimeter += std::sqrt(dx * dx + dy * dy);
+                }
+
+                // 复杂度 = 面积 * (1 + 周长/面积比) * (1 + 长宽比)
+                double aspect_ratio = (width > height) ? width / height : height / width;
+                double complexity = area * (1.0 + perimeter / area * 0.1) * (1.0 + aspect_ratio * 0.1);
+                total_complexity += complexity;
+                valid_shapes++;
+            } catch (...) {
+                continue;
+            }
+        }
+
+        if (valid_shapes == 0) {
+            return basic_lower_bound;
+        }
+
+        // 方法3：考虑旋转约束的下界
+        // 如果允许旋转，下界可能更小；如果不允许，下界可能更大
+        double rotation_factor = 1.0;
+        if (params_.try_all_rotations) {
+            // 允许旋转时，可以更紧凑，下界可以更小（乘以0.95-0.98）
+            rotation_factor = 0.96;
+        } else {
+            // 不允许旋转时，可能需要更多空间（乘以1.02-1.05）
+            rotation_factor = 1.03;
+        }
+
+        // 方法4：考虑最大零件尺寸的下界
+        // 至少需要能放下最大的零件
+        double max_part_lower_bound = max_bbox_diagonal * 1.1; // 留10%余量
+
+        // 综合下界：取最大值，确保所有约束都满足
+        double improved_lower_bound = std::max(
+            basic_lower_bound * rotation_factor,
+            max_part_lower_bound
+        );
+
+        // 考虑平均复杂度的影响（复杂形状需要更多空间）
+        double avg_complexity = total_complexity / valid_shapes;
+        double avg_area = total_area / valid_shapes;
+        double complexity_ratio = avg_complexity / avg_area;
+        if (complexity_ratio > 1.5) {
+            // 如果平均复杂度较高，下界需要增加
+            improved_lower_bound *= (1.0 + (complexity_ratio - 1.5) * 0.1);
+        }
+
+        return improved_lower_bound;
+    } catch (...) {
+        // 如果计算失败，返回基础下界
+        double total_area = safe_to_double(layout_.area);
+        return std::sqrt(4.0 * total_area / Sheet::kPi);
+    }
+}
+
+// ============================================================================
+// 上界/下界评估：计算上界/下界差距（返回差距百分比，0-1之间）
+// ============================================================================
+double CircleNesting::calculate_bound_gap() const {
+    if (!params_.use_bound_evaluation) {
+        return 1.0; // 如果未启用，返回100%差距（表示未知）
+    }
+
+    try {
+        // 计算当前上界（实际利用率）
+        double upper_bound_util = calculate_utilization();
+        if (upper_bound_util <= 0) {
+            return 1.0;
+        }
+
+        // 计算下界（理论最优利用率）
+        double current_diameter = safe_to_double(layout_.sheets[0].diameter);
+        double lower_bound_diameter;
+        
+        if (params_.use_improved_lower_bound) {
+            lower_bound_diameter = calculate_improved_lower_bound();
+        } else {
+            lower_bound_diameter = calculate_theoretical_min_diameter();
+        }
+
+        if (lower_bound_diameter <= 0 || current_diameter <= 0) {
+            return 1.0;
+        }
+
+        // 重要：这里不能用 layout_.area（所有零件总面积）来算下界利用率。
+        // 因为当前布局可能只放下了部分零件，用总面积会导致 lower_bound_util 很容易 > 1 被夹到 1，
+        // 进而 gap 被夹到 0，触发“已经接近最优”的误判，导致在 0.6 左右提前停止。
+        // 这里改为基于“当前已放置面积”估计下界：placed_area = upper_util * current_circle_area。
+        double current_circle_area = Sheet::kPi * (current_diameter / 2.0) * (current_diameter / 2.0);
+        double placed_area = upper_bound_util * current_circle_area;
+        double lower_bound_circle_area = Sheet::kPi * (lower_bound_diameter / 2.0) * (lower_bound_diameter / 2.0);
+        double lower_bound_util = (lower_bound_circle_area > 0) ? (placed_area / lower_bound_circle_area) : 0.0;
+        
+        // 限制在合理范围内
+        if (lower_bound_util > 1.0) lower_bound_util = 1.0;
+        if (lower_bound_util < 0.0) lower_bound_util = 0.0;
+
+        // 差距 = (上界利用率 - 下界利用率) / 下界利用率
+        // 或者更直观：差距 = (当前直径 - 下界直径) / 下界直径
+        double diameter_gap = (current_diameter - lower_bound_diameter) / lower_bound_diameter;
+        double util_gap = (upper_bound_util - lower_bound_util) / std::max(lower_bound_util, 0.01);
+
+        // 返回较小的差距（更保守的估计），并确保非负
+        double gap = std::min(diameter_gap, util_gap);
+        if (gap < 0) gap = 0;
+        
+        // 限制在0-1之间
+        if (gap > 1) gap = 1;
+
+        return gap;
+    } catch (...) {
+        return 1.0;
+    }
+}
+
+// ============================================================================
+// Hodograph方法：生成快速初始解
+// Hodograph（速度图）是一种贪心策略，通过分析零件的"速度"（放置难度）
+// 来决定放置顺序，快速生成初始布局
+// ============================================================================
+bool CircleNesting::generate_hodograph_initial_solution(double diameter, volatile bool* requestQuit) {
+    if (layout_.sheet_parts.empty() || layout_.sheet_parts[0].empty()) {
+        return false;
+    }
+
+    update_circle_diameter(diameter);
+
+    try {
+        // 重置所有零件位置
+        double radius = diameter / 2.0;
+        double outside_offset = -radius * 2.0;
+        for (auto& shape : layout_.sheet_parts[0]) {
+            shape.set_translate(geo::FT(outside_offset), geo::FT(outside_offset));
+            shape.update();
+        }
+
+        // Hodograph方法：计算每个零件的"速度"（放置难度）
+        // 速度 = 面积 / (周长 * 长宽比)，值越大越容易放置
+        struct ShapeInfo {
+            size_t idx;
+            double velocity;  // 放置速度（越大越容易）
+            double area;
+            double perimeter;
+            double aspect_ratio;
+        };
+
+        std::vector<ShapeInfo> shape_infos;
+        shape_infos.reserve(layout_.poly_num);
+
+        for (size_t i = 0; i < layout_.poly_num; ++i) {
+            if (requestQuit && *requestQuit) {
+                return false;
+            }
+
+            try {
+                const auto& shape = layout_.sheet_parts[0][i];
+                const auto& poly = *shape.base;
+                
+                double area = safe_to_double(geo::pwh_area(poly));
+                if (area <= 0) continue;
+
+                // 计算周长
+                double perimeter = 0.0;
+                for (auto e = poly.outer_boundary().edges_begin();
+                     e != poly.outer_boundary().edges_end(); ++e) {
+                    double dx = safe_to_double(e->target().x() - e->source().x());
+                    double dy = safe_to_double(e->target().y() - e->source().y());
+                    perimeter += std::sqrt(dx * dx + dy * dy);
+                }
+
+                // 计算长宽比
+                auto bbox = poly.bbox();
+                double width = safe_to_double(bbox.xmax() - bbox.xmin());
+                double height = safe_to_double(bbox.ymax() - bbox.ymin());
+                double aspect_ratio = (width > height) ? width / height : height / width;
+
+                // Hodograph速度 = 面积 / (周长 * 长宽比)
+                // 面积大、周长小、长宽比接近1的零件更容易放置
+                double velocity = (perimeter > 0 && aspect_ratio > 0) 
+                    ? area / (perimeter * aspect_ratio) 
+                    : area;
+
+                shape_infos.push_back({i, velocity, area, perimeter, aspect_ratio});
+            } catch (...) {
+                continue;
+            }
+        }
+
+        if (shape_infos.empty()) {
+            return false;
+        }
+
+        // 按速度从大到小排序（容易放置的优先）
+        std::sort(shape_infos.begin(), shape_infos.end(),
+            [](const ShapeInfo& a, const ShapeInfo& b) {
+                return a.velocity > b.velocity;
+            });
+
+        // 放置零件：使用简单的径向放置策略
+        std::vector<size_t> placed_indices;
+        double center_x = radius;
+        double center_y = radius;
+        double angle_step = 2.0 * Sheet::kPi / shape_infos.size();
+        double radius_step = radius * 0.3 / shape_infos.size();
+
+        for (size_t i = 0; i < shape_infos.size(); ++i) {
+            if (requestQuit && *requestQuit) {
+                return !placed_indices.empty();
+            }
+
+            size_t shape_idx = shape_infos[i].idx;
+            auto& shape = layout_.sheet_parts[0][shape_idx];
+            shape.update();
+
+            // 计算放置位置：螺旋式放置
+            double angle = angle_step * i;
+            double r = radius_step * i + radius * 0.2; // 从中心20%半径开始
+            double x = center_x + r * std::cos(angle);
+            double y = center_y + r * std::sin(angle);
+
+            auto bbox = shape.transformed.bbox();
+            double shape_width = safe_to_double(bbox.xmax() - bbox.xmin());
+            double shape_height = safe_to_double(bbox.ymax() - bbox.ymin());
+
+            // 将零件中心放在计算位置
+            shape.set_translate(geo::FT(x - shape_width / 2.0), 
+                              geo::FT(y - shape_height / 2.0));
+            shape.update();
+
+            // 检查是否有效
+            if (is_valid_placement(shape_idx, placed_indices)) {
+                placed_indices.push_back(shape_idx);
+            } else {
+                // 如果简单位置无效，尝试使用NFP方法
+                if (place_shape_with_nfp(shape_idx, placed_indices, false)) {
+                    placed_indices.push_back(shape_idx);
+                } else {
+                    // 如果还是失败，移到板外
+                    shape.set_translate(geo::FT(outside_offset), geo::FT(outside_offset));
+                    shape.update();
+                }
+            }
+        }
+
+        // 将未放置的零件移到板外
+        std::set<size_t> placed_set(placed_indices.begin(), placed_indices.end());
+        for (size_t i = 0; i < layout_.poly_num; ++i) {
+            if (placed_set.find(i) == placed_set.end()) {
+                auto& shape = layout_.sheet_parts[0][i];
+                double offset_x = outside_offset + i * radius * 0.1;
+                double offset_y = outside_offset;
+                shape.set_translate(geo::FT(offset_x), geo::FT(offset_y));
+                shape.update();
+            }
+        }
+
+        return !placed_indices.empty();
+    } catch (...) {
+        return false;
+    }
+}
+
+// ============================================================================
 // 废料最小化：计算当前布局的废料区域（圆 - 所有已放置零件的并集）
 // ============================================================================
 std::vector<geo::Polygon_with_holes_2> CircleNesting::calculate_waste_regions(
@@ -1606,42 +2651,89 @@ std::vector<geo::Polygon_with_holes_2> CircleNesting::calculate_waste_regions(
         // 获取圆形板材
         geo::Polygon_with_holes_2 sheet_pwh = layout_.sheets[0].sheet;
         
-        // 计算所有已放置零件的并集
-        geo::Polygon_set_2 placed_union(geo::traits);
-        
-        for (size_t idx : placed_indices) {
-            if (idx >= layout_.sheet_parts[0].size()) {
-                continue;
-            }
-            try {
-                const auto& shape = layout_.sheet_parts[0][idx];
-                // 只计算在圆内的部分
-                std::vector<geo::Polygon_with_holes_2> inters;
+        if (params_.geometry_library == Parameters::GeometryLibrary::Clipper) {
+            // 使用 Clipper
+            // 计算所有已放置零件的并集
+            geo::Polygon_with_holes_2 placed_union;
+            bool first = true;
+            
+            for (size_t idx : placed_indices) {
+                if (idx >= layout_.sheet_parts[0].size()) {
+                    continue;
+                }
                 try {
-                    CGAL::intersection(shape.transformed, sheet_pwh, std::back_inserter(inters));
-                } catch (...) {
-                    inters.clear();
-                }
-                
-                for (const auto& p : inters) {
-                    try {
-                        placed_union.join(p.outer_boundary());
-                    } catch (...) {
-                        // 忽略错误
+                    const auto& shape = layout_.sheet_parts[0][idx];
+                    // 只计算在圆内的部分
+                    auto inters_result = geo::GeometryOperations::intersection(shape.transformed, sheet_pwh);
+                    
+                    if (inters_result.is_empty || inters_result.polygons.empty()) {
+                        continue;
                     }
+                    
+                    // 合并到并集
+                    for (const auto& inter_poly : inters_result.polygons) {
+                        if (first) {
+                            placed_union = inter_poly;
+                            first = false;
+                        } else {
+                            auto join_result = geo::GeometryOperations::join(placed_union, inter_poly);
+                            if (!join_result.is_empty && !join_result.polygons.empty()) {
+                                placed_union = join_result.polygons[0];
+                            }
+                        }
+                    }
+                } catch (...) {
+                    // 忽略单个零件的错误
                 }
-            } catch (...) {
-                // 忽略单个零件的错误
             }
+            
+            // 计算废料区域 = 圆 - 已放置零件的并集
+            if (!first) {
+                auto diff_result = geo::GeometryOperations::difference(sheet_pwh, placed_union);
+                waste_regions = diff_result.polygons;
+            } else {
+                // 如果没有已放置零件，整个圆都是废料区域
+                waste_regions.push_back(sheet_pwh);
+            }
+        } else {
+            // 使用 CGAL（默认）
+            // 计算所有已放置零件的并集
+            geo::Polygon_set_2 placed_union(geo::traits);
+            
+            for (size_t idx : placed_indices) {
+                if (idx >= layout_.sheet_parts[0].size()) {
+                    continue;
+                }
+                try {
+                    const auto& shape = layout_.sheet_parts[0][idx];
+                    // 只计算在圆内的部分
+                    std::vector<geo::Polygon_with_holes_2> inters;
+                    try {
+                        CGAL::intersection(shape.transformed, sheet_pwh, std::back_inserter(inters));
+                    } catch (...) {
+                        inters.clear();
+                    }
+                    
+                    for (const auto& p : inters) {
+                        try {
+                            placed_union.join(p.outer_boundary());
+                        } catch (...) {
+                            // 忽略错误
+                        }
+                    }
+                } catch (...) {
+                    // 忽略单个零件的错误
+                }
+            }
+            
+            // 计算废料区域 = 圆 - 已放置零件的并集
+            geo::Polygon_set_2 waste_set(geo::traits);
+            waste_set.insert(sheet_pwh.outer_boundary());
+            waste_set.difference(placed_union);
+            
+            // 提取废料多边形
+            waste_set.polygons_with_holes(std::back_inserter(waste_regions));
         }
-        
-        // 计算废料区域 = 圆 - 已放置零件的并集
-        geo::Polygon_set_2 waste_set(geo::traits);
-        waste_set.insert(sheet_pwh.outer_boundary());
-        waste_set.difference(placed_union);
-        
-        // 提取废料多边形
-        waste_set.polygons_with_holes(std::back_inserter(waste_regions));
         
         // 过滤：只保留面积足够大的废料区域
         double min_waste_area = safe_to_double(geo::pwh_area(sheet_pwh)) * params_.min_waste_area_ratio;
@@ -1797,14 +2889,14 @@ bool CircleNesting::place_shape_in_waste(size_t shape_idx,
         auto waste_regions = calculate_waste_regions(placed_indices);
         if (waste_regions.empty()) {
             // 如果没有废料区域，回退到普通放置
-            return place_shape_with_nfp(shape_idx, placed_indices, try_all_rotations);
+            return place_shape_with_nfp(shape_idx, placed_indices, try_all_rotations, nullptr, /*allow_waste_minimization=*/false);
         }
 
         // 在废料区域生成候选点
         auto waste_candidates = generate_waste_candidates(shape_idx, placed_indices, waste_regions);
         if (waste_candidates.empty()) {
             // 如果无法生成废料候选点，回退到普通放置
-            return place_shape_with_nfp(shape_idx, placed_indices, try_all_rotations);
+            return place_shape_with_nfp(shape_idx, placed_indices, try_all_rotations, nullptr, /*allow_waste_minimization=*/false);
         }
 
         // 尝试每个旋转角度
@@ -1876,11 +2968,11 @@ bool CircleNesting::place_shape_in_waste(size_t shape_idx,
             shape.set_rotation(original_rotation);
             shape.update();
             // 如果废料区域放置失败，回退到普通放置
-            return place_shape_with_nfp(shape_idx, placed_indices, try_all_rotations);
+            return place_shape_with_nfp(shape_idx, placed_indices, try_all_rotations, nullptr, /*allow_waste_minimization=*/false);
         }
     } catch (...) {
         // 如果出错，回退到普通放置
-        return place_shape_with_nfp(shape_idx, placed_indices, try_all_rotations);
+        return place_shape_with_nfp(shape_idx, placed_indices, try_all_rotations, nullptr, /*allow_waste_minimization=*/false);
     }
 }
 

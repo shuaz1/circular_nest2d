@@ -41,8 +41,11 @@ namespace nesting {
 
     // 圆形板材高利用率排样算法
     // fast_mode = true 时，启用极速模式：大幅减少迭代与候选点数量，以速度优先
-    void start_ga(Layout& layout,
+    // use_clipper = true 时，使用 Clipper 库进行几何运算（更快，2-10倍速度提升）
+    void start_ga(const size_t max_time,
+        Layout& layout,
         std::function<void(const Solution&)> ProgressHandler,
         volatile bool* requestQuit,
-        bool fast_mode);
+        bool fast_mode,
+        bool use_clipper = false);
 }  // namespace nesting

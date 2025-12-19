@@ -4,7 +4,7 @@ namespace nesting {
     // Helper: check if a polygon (already transformed to sheet coords) fits into circular sheet
     static bool fits_in_circle(const Sheet& sheet, const Polygon_with_holes_2& poly, double safety_margin = 1e-9) {
         if (sheet.type != Sheet::ShapeType::Circle) return true;
-        double d = CGAL::to_double(sheet.diameter);
+        double d = safe_to_double(sheet.diameter);
         double cx = d / 2.0;
         double cy = d / 2.0;
         double r = d / 2.0;
@@ -12,8 +12,8 @@ namespace nesting {
         double limit2 = limit * limit;
         // check outer boundary vertices
         for (auto v = poly.outer_boundary().vertices_begin(); v != poly.outer_boundary().vertices_end(); ++v) {
-            double vx = CGAL::to_double(v->x());
-            double vy = CGAL::to_double(v->y());
+            double vx = safe_to_double(v->x());
+            double vy = safe_to_double(v->y());
             double dx = vx - cx;
             double dy = vy - cy;
             if (dx * dx + dy * dy > limit2) return false;

@@ -2,6 +2,19 @@
 #include "sheet.h"
 #include "algorithm.h"
 
+// GUI 层安全转换：避免 CGAL::Uncertain_conversion_exception 刷屏
+namespace {
+    inline double gui_safe_to_double(const nesting::geo::FT& v) {
+        auto I = CGAL::to_interval(v);
+        double a = I.first;
+        double b = I.second;
+        if (!std::isfinite(a) || !std::isfinite(b)) {
+            return 0.0;
+        }
+        return 0.5 * (a + b);
+    }
+}
+
 nesting_gui::nesting_gui(QWidget* parent) : QMainWindow(parent) {
     ui.setupUi(this);
     // Part1 设置各表格自动拉伸
@@ -138,21 +151,14 @@ nesting_gui::nesting_gui(QWidget* parent) : QMainWindow(parent) {
 
     connect(timer, &QTimer::timeout, [&]() {
         // 处理progressBar
-        qDebug() << "timer START";
         auto max = ui.progressBar->maximum();
         auto min = ui.progressBar->minimum();
         if (max != 0 || min != 0) {
-            if (time > max) {
-                if (timer->isActive()) {
-                    qDebug() << "stop timer 2";
-                    ui.StopButton->click();
-                }
+            if (time == max) {
+                time = 0;
             }
-            else {
-                ui.progressBar->setValue(time + 1);
-            }
+            ui.progressBar->setValue(time);
         }
-        // 处理Chart
         if (ui.resultTable->rowCount() > 0) {
             series->append(
                 time, ui.resultTable->item(0, 1)->data(Qt::DisplayRole).toReal());
@@ -162,7 +168,6 @@ nesting_gui::nesting_gui(QWidget* parent) : QMainWindow(parent) {
         }
         ui.ChartScrollBar->setMaximum(ui.ChartScrollBar->maximum() + 1);
         ++time;
-        qDebug() << "timer END";
         });
 }
 
@@ -494,6 +499,7 @@ void nesting_gui::toSVG() {
 void nesting_gui::start() {
     // 清空上次的ui
     qDebug() << "start";
+    qDebug() << "[DEBUG] ========== 开始排料 ==========";
     ui.progressBar->setRange(0, 100);
     ui.progressBar->setValue(0);
     series->clear();
@@ -560,6 +566,7 @@ void nesting_gui::start() {
     // 其他参数
     auto need_simplify = ui.needSimplify->isChecked();
     auto fast_mode = ui.fastModeCheckBox ? ui.fastModeCheckBox->isChecked() : false;
+    auto use_clipper = ui.useClipperCheckBox ? ui.useClipperCheckBox->isChecked() : false;
     auto part_offset = ui.partSpacingSpinBox->value();
     auto top_offset = ui.TopSpinBox->value();
     auto bottom_offset = ui.BottomSpinBox->value();
@@ -590,12 +597,15 @@ void nesting_gui::start() {
     if (ui.fastModeCheckBox) {
         ui.fastModeCheckBox->setDisabled(true);
     }
+    if (ui.useClipperCheckBox) {
+        ui.useClipperCheckBox->setDisabled(true);
+    }
     // 开启时钟
     time = 0;
     timer->start(1000);
     startWork(need_simplify, top_offset, left_offset, bottom_offset, right_offset,
         part_offset, sheet_width, sheet_height, seconds, polygons,
-        allowed_rotations, quantity, segments, fast_mode);
+        allowed_rotations, quantity, segments, fast_mode, use_clipper);
 }
 
 void nesting_gui::stop() {
@@ -604,14 +614,17 @@ void nesting_gui::stop() {
     if (timer->isActive()) {
         timer->stop();
     }
-    // 强制停止线程
+    // 强制停止线程（恢复为原有逻辑：使用等待对话框 + 事件循环）
     if (worker != nullptr && worker->isRunning()) {
         waitDialog = new QDialog(this);
         UIWaitDialog.setupUi(waitDialog);
+        // 先请求线程优雅退出
         worker->quit();
         worker->requestQuit();
+        // 等待对话框不允许用户自行关闭
         waitDialog->setWindowFlag(Qt::WindowCloseButtonHint, false);
         waitDialog->open();
+        // 使用本地事件循环等待线程结束
         QEventLoop loop;
         connect(worker, &QThread::finished, &loop, &QEventLoop::quit);
         loop.exec();
@@ -653,8 +666,8 @@ void nesting_gui::handleProgress(Solution solu,
         bool in_circle = false;
         const auto& outer = pwh.outer_boundary();
         for (auto v = outer.vertices_begin(); v != outer.vertices_end(); ++v) {
-            double x = CGAL::to_double(v->x());
-            double y = CGAL::to_double(v->y());
+            double x = gui_safe_to_double(v->x());
+            double y = gui_safe_to_double(v->y());
             double dx = x - cx;
             double dy = y - cy;
             double dist_sq = dx * dx + dy * dy;
@@ -668,7 +681,7 @@ void nesting_gui::handleProgress(Solution solu,
         }
 
         try {
-            parts_area += CGAL::to_double(nesting::geo::pwh_area(pwh));
+            parts_area += gui_safe_to_double(nesting::geo::pwh_area(pwh));
         } catch (...) {
             // 忽略单个多边形的面积计算错误
         }
@@ -695,7 +708,7 @@ void nesting_gui::handleProgress(Solution solu,
         auto& pwh = pgns[i];
         auto& outer = pwh.outer_boundary();
         for (auto v = outer.vertices_begin(); v != outer.vertices_end(); v++) {
-            polygon.append(QPointF(CGAL::to_double(v->x()), CGAL::to_double(v->y())));
+            polygon.append(QPointF(gui_safe_to_double(v->x()), gui_safe_to_double(v->y())));
         }
         display_pgns.append(polygon);
     }
@@ -724,7 +737,8 @@ void nesting_gui::startWork(
     const std::vector<uint32_t>& items_rotations,
     const std::vector<uint32_t>& items_quantity,
     const int circle_segments,
-    const bool fast_mode) {
+    const bool fast_mode,
+    const bool use_clipper) {
     // Part6 设置线程
     qDebug() << "start work START";
     worker = new Worker(this);
@@ -733,7 +747,7 @@ void nesting_gui::startWork(
     connect(worker, &Worker::sendMessage, this, &nesting_gui::handleMessage);
     worker->set(need_simplify, top_offset, left_offset, bottom_offset,
         right_offset, part_offset, sheet_width, sheet_height, max_time,
-        polygons, items_rotations, items_quantity, circle_segments, fast_mode);
+        polygons, items_rotations, items_quantity, circle_segments, fast_mode, use_clipper);
     worker->start();
     qDebug() << "start work END";
 }

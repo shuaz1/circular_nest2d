@@ -1,6 +1,7 @@
 ﻿#include "interface.h"
 #include "circle_nesting.h"
 #include <ctime>
+#include <iostream>
 
 namespace nesting {
 
@@ -10,13 +11,15 @@ namespace nesting {
         volatile bool* requestQuit) {
         // 圆形板材专用：直接使用高利用率算法
         // 这里默认使用高质量模式（fast_mode = false）
-        start_ga(layout, ProgressHandler, requestQuit, false);
+        start_ga(max_time, layout, ProgressHandler, requestQuit, false);
     }
 
-    void start_ga(Layout& layout,
+    void start_ga(const size_t max_time,
+        Layout& layout,
         std::function<void(const Solution&)> ProgressHandler,
         volatile bool* requestQuit,
-        bool fast_mode) {
+        bool fast_mode,
+        bool use_clipper) {
         // 只支持圆形板材
         if (layout.sheets.empty() || layout.sheets[0].type != Sheet::ShapeType::Circle) {
             throw std::runtime_error("只支持圆形板材排样");
@@ -25,9 +28,29 @@ namespace nesting {
         clock_t start_clock = clock();
         
         CircleNesting circle_nesting(layout);
+        // 软截止：到点后若已达标才允许停止（未达标则继续）
+        circle_nesting.set_time_limit_seconds(max_time);
+        // 硬保底：未达到 0.85 前忽略 soft time limit
+        circle_nesting.set_quality_gate(0.85);
+        // 防止无限运行：默认硬上限 30 分钟（可后续做成 GUI 参数）
+        circle_nesting.set_hard_time_limit_seconds(30 * 60);
 
         // 设置参数
         CircleNesting::Parameters params;
+
+        std::cerr << "[start_ga] fast_mode=" << (fast_mode ? 1 : 0)
+                  << " use_clipper=" << (use_clipper ? 1 : 0) << std::endl;
+        
+        // 根据参数选择几何库（GUI 控制）
+        if (use_clipper) {
+            params.geometry_library = CircleNesting::Parameters::GeometryLibrary::Clipper;
+        } else {
+            params.geometry_library = CircleNesting::Parameters::GeometryLibrary::CGAL;
+        }
+
+        std::cerr << "[start_ga] geometry_library="
+                  << (params.geometry_library == CircleNesting::Parameters::GeometryLibrary::Clipper ? "Clipper" : "CGAL")
+                  << std::endl;
 
         if (fast_mode) {
             // ==========================
@@ -89,7 +112,7 @@ namespace nesting {
         circle_nesting.set_parameters(params);
         
         auto progress_wrapper = [&](const Layout& l) {
-            double length = CGAL::to_double(l.sheets[0].diameter);
+            double length = nesting::safe_to_double(l.sheets[0].diameter);
             double elapsed = static_cast<double>(clock() - start_clock) / CLOCKS_PER_SEC;
 
             // 始终优先使用 best_result，确保显示的是最佳利用率（避免显示下降）
@@ -112,7 +135,7 @@ namespace nesting {
                         util = l.best_utilization;
                     } else {
                         // 临时计算（简化版，实际应该调用 CircleNesting::calculate_utilization）
-                        double total_area = CGAL::to_double(l.area);
+                        double total_area = nesting::safe_to_double(l.area);
                         double circle_area = Sheet::kPi * length * length / 4.0;
                         if (circle_area > 0) {
                             util = total_area / circle_area;
@@ -130,9 +153,8 @@ namespace nesting {
         };
         
         // 执行优化
-        // - 默认模式：目标利用率 92%（优秀级别）
-        // - 极速模式：目标利用率略放宽到 90%，进一步换取速度
-        double target_util = fast_mode ? 0.90 : 0.92;
+        // 目标利用率按用户要求：0.85（并受 max_time 时间预算约束）
+        double target_util = 0.85;
         bool success = circle_nesting.optimize(target_util, requestQuit, progress_wrapper);
         
         // 无论成功与否，都确保报告最佳结果（避免停止时显示下降）

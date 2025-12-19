@@ -3,13 +3,26 @@
 #include "candidate_points.h"
 #include <vector>
 #include <functional>
+#include <chrono>
 
 namespace nesting {
+
+    // 全局安全转换：用于将 CGAL 精确数值转换为 double（使用 interval，避免异常）
+    double safe_to_double(const geo::FT& v);
 
     // 高利用率圆形排样核心算法
     class CircleNesting {
     public:
         explicit CircleNesting(Layout& layout);
+
+        // 设置全局时间预算（秒）。0 表示不限制。
+        void set_time_limit_seconds(size_t seconds);
+
+        // 设置硬上限时间（秒）。0 表示不限制。
+        void set_hard_time_limit_seconds(size_t seconds);
+
+        // 设置质量门槛：在未达到 gate_utilization 前，忽略 soft time limit。
+        void set_quality_gate(double gate_utilization);
 
         // 圆形排样参数
         struct Parameters {
@@ -57,6 +70,19 @@ namespace nesting {
             bool use_waste_minimization = true;    // 是否启用废料区域识别与优先填充
             double min_waste_area_ratio = 0.01;   // 最小废料区域面积比例（小于此值的废料区域忽略）
             size_t max_waste_candidates = 50;     // 每个废料区域最多生成的候选点数
+
+            // 上界/下界评估参数
+            bool use_bound_evaluation = true;      // 是否启用上界/下界差距评估
+            double bound_gap_threshold = 0.01;     // 差距阈值（1%），当差距小于此值时提前停止优化
+            bool use_improved_lower_bound = true;  // 是否使用改进的下界计算（考虑形状约束）
+            bool use_hodograph_initial = false;    // 是否使用Hodograph方法生成快速初始解
+
+            // 几何库选择参数
+            enum class GeometryLibrary {
+                CGAL,      // 使用 CGAL（精确但较慢）
+                Clipper    // 使用 Clipper（快速但需要整数坐标）
+            };
+            GeometryLibrary geometry_library = GeometryLibrary::CGAL;  // 默认使用 CGAL
         };
 
         void set_parameters(const Parameters& params);
@@ -79,6 +105,17 @@ namespace nesting {
         double best_utilization_;
         double current_diameter_;
 
+        bool use_time_limit_{ false };
+        std::chrono::steady_clock::time_point deadline_;
+
+        bool use_hard_time_limit_{ false };
+        std::chrono::steady_clock::time_point hard_deadline_;
+
+        bool use_quality_gate_{ false };
+        double quality_gate_{ 0.0 };
+
+        bool should_stop(volatile bool* requestQuit) const;
+
         // 计算理论最小直径（基于总面积）
         double calculate_theoretical_min_diameter() const;
 
@@ -94,9 +131,13 @@ namespace nesting {
         bool try_place_all_parts(double diameter, volatile bool* requestQuit,
                                  std::function<void(const Layout&)>* progress_callback = nullptr);
 
-        // 基于NFP的精确放置（针对圆形优化）
-        bool place_shape_with_nfp(size_t shape_idx, const std::vector<size_t>& placed_indices, 
-                                 bool try_all_rotations = true);
+        // 基于 NFP 的精确放置（针对圆形优化）
+        // 增加 requestQuit 参数，便于在深度循环中及时响应“停止”请求
+        bool place_shape_with_nfp(size_t shape_idx,
+                                  const std::vector<size_t>& placed_indices, 
+                                  bool try_all_rotations = true,
+                                  volatile bool* requestQuit = nullptr,
+                                  bool allow_waste_minimization = true);
 
         // 生成圆形优化的候选点
         std::vector<geo::Point_2> generate_circular_candidates(
@@ -129,6 +170,13 @@ namespace nesting {
         // 检查零件是否在圆内且无重叠
         bool is_valid_placement(size_t shape_idx, const std::vector<size_t>& placed_indices) const;
 
+        // CGAL 模式下使用的简化版合法性检查（用于保证稳定性）
+        bool is_valid_placement_cgal_simple(size_t shape_idx,
+                                            const std::vector<size_t>& placed_indices) const;
+
+        // 几何尺寸预检查：判断零件在当前圆直径下是否“无论如何都放不下”
+        bool can_never_fit_in_circle(size_t shape_idx) const;
+
         // 更新圆直径并重建sheet
         void update_circle_diameter(double diameter);
 
@@ -147,6 +195,16 @@ namespace nesting {
         bool place_shape_in_waste(size_t shape_idx, 
                                   const std::vector<size_t>& placed_indices,
                                   bool try_all_rotations);
+
+        // 上界/下界评估相关函数
+        // 计算改进的下界（考虑形状约束和旋转限制）
+        double calculate_improved_lower_bound() const;
+
+        // 计算上界/下界差距（返回差距百分比，0-1之间）
+        double calculate_bound_gap() const;
+
+        // 使用Hodograph方法生成快速初始解
+        bool generate_hodograph_initial_solution(double diameter, volatile bool* requestQuit);
     };
 
 } // namespace nesting
