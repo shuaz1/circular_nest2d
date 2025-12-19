@@ -634,24 +634,8 @@ bool CircleNesting::is_valid_placement(size_t shape_idx, const std::vector<size_
                 }
             }
             
-            // 如果检测成功且发现重叠，返回 false
-            // 大幅放宽容差，避免数值误差导致误判
-            // 使用相对容差：重叠面积必须超过较小形状面积的1%才认为真正重叠
-            double shape_area_i = 0.0, shape_area_j = 0.0;
-            try {
-                // 面积与平移/旋转无关，优先用 base，避免频繁对 transformed 做 CGAL 计算
-                if (shape.base) {
-                    shape_area_i = safe_to_double(geo::pwh_area(*shape.base));
-                }
-                if (shape_j.base) {
-                    shape_area_j = safe_to_double(geo::pwh_area(*shape_j.base));
-                }
-            } catch (...) {
-                // 如果面积计算失败，使用固定容差
-            }
-            double min_shape_area = std::min(shape_area_i, shape_area_j);
-            double overlap_tolerance = std::max(1e-4, min_shape_area * 0.01); // 至少1e-4，或较小形状面积的1%
-            
+            // 如果检测成功且发现重叠，返回 false（严格不重叠）
+            const double overlap_tolerance = 1e-12;
             if (check_succeeded && overlap_area > overlap_tolerance) {
                 return false;
             }
