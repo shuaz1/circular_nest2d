@@ -410,6 +410,15 @@ bool CircleNesting::place_shape_with_nfp(size_t shape_idx, const std::vector<siz
         return false;
     }
 
+    // 如果启用废料最小化且已有放置的零件，优先尝试在废料区域放置
+    if (params_.use_waste_minimization && !placed_indices.empty()) {
+        bool placed = place_shape_in_waste(shape_idx, placed_indices, try_all_rotations);
+        if (placed) {
+            return true;
+        }
+        // 如果废料区域放置失败，继续使用普通NFP方法
+    }
+
     auto& shape = layout_.sheet_parts[0][shape_idx];
     
     try {
@@ -817,7 +826,46 @@ void CircleNesting::compact_layout(size_t iterations, volatile bool* requestQuit
                 directions.push_back({dx_to_part, dy_to_part});
             }
             
-            // 方向3：随机方向（探索性搜索）
+            // 方向3：向最大废料区域（如果启用废料最小化）
+            if (params_.use_waste_minimization && iter % 10 == 0) {
+                try {
+                    std::vector<size_t> other_indices_for_waste;
+                    for (size_t j = 0; j < layout_.poly_num; ++j) {
+                        if (j != idx) other_indices_for_waste.push_back(j);
+                    }
+                    auto waste_regions = calculate_waste_regions(other_indices_for_waste);
+                    if (!waste_regions.empty()) {
+                        // 找到最大废料区域的质心
+                        const auto& largest_waste = waste_regions[0];
+                        try {
+                            double waste_cx = 0.0, waste_cy = 0.0;
+                            size_t vertex_count = 0;
+                            for (auto v = largest_waste.outer_boundary().vertices_begin();
+                                 v != largest_waste.outer_boundary().vertices_end(); ++v) {
+                                waste_cx += safe_to_double(v->x());
+                                waste_cy += safe_to_double(v->y());
+                                vertex_count++;
+                            }
+                            if (vertex_count > 0) {
+                                waste_cx /= vertex_count;
+                                waste_cy /= vertex_count;
+                                double dx_to_waste = waste_cx - cx;
+                                double dy_to_waste = waste_cy - cy;
+                                double dist_to_waste = std::sqrt(dx_to_waste * dx_to_waste + dy_to_waste * dy_to_waste);
+                                if (dist_to_waste > 1e-6) {
+                                    directions.push_back({dx_to_waste / dist_to_waste, dy_to_waste / dist_to_waste});
+                                }
+                            }
+                        } catch (...) {
+                            // 如果计算失败，跳过
+                        }
+                    }
+                } catch (...) {
+                    // 如果废料计算失败，跳过
+                }
+            }
+            
+            // 方向4：随机方向（探索性搜索）
             double random_angle = dis(gen) * 2.0 * Sheet::kPi;
             directions.push_back({std::cos(random_angle), std::sin(random_angle)});
 
@@ -1539,6 +1587,301 @@ double CircleNesting::binary_search_diameter(double min_diameter, double max_dia
     }
     
     return best_diameter;
+}
+
+// ============================================================================
+// 废料最小化：计算当前布局的废料区域（圆 - 所有已放置零件的并集）
+// ============================================================================
+std::vector<geo::Polygon_with_holes_2> CircleNesting::calculate_waste_regions(
+    const std::vector<size_t>& placed_indices) const {
+    std::vector<geo::Polygon_with_holes_2> waste_regions;
+    
+    if (placed_indices.empty()) {
+        // 如果没有已放置零件，整个圆都是"废料"（实际上是可以放置的区域）
+        waste_regions.push_back(layout_.sheets[0].sheet);
+        return waste_regions;
+    }
+
+    try {
+        // 获取圆形板材
+        geo::Polygon_with_holes_2 sheet_pwh = layout_.sheets[0].sheet;
+        
+        // 计算所有已放置零件的并集
+        geo::Polygon_set_2 placed_union(geo::traits);
+        
+        for (size_t idx : placed_indices) {
+            if (idx >= layout_.sheet_parts[0].size()) {
+                continue;
+            }
+            try {
+                const auto& shape = layout_.sheet_parts[0][idx];
+                // 只计算在圆内的部分
+                std::vector<geo::Polygon_with_holes_2> inters;
+                try {
+                    CGAL::intersection(shape.transformed, sheet_pwh, std::back_inserter(inters));
+                } catch (...) {
+                    inters.clear();
+                }
+                
+                for (const auto& p : inters) {
+                    try {
+                        placed_union.join(p.outer_boundary());
+                    } catch (...) {
+                        // 忽略错误
+                    }
+                }
+            } catch (...) {
+                // 忽略单个零件的错误
+            }
+        }
+        
+        // 计算废料区域 = 圆 - 已放置零件的并集
+        geo::Polygon_set_2 waste_set(geo::traits);
+        waste_set.insert(sheet_pwh.outer_boundary());
+        waste_set.difference(placed_union);
+        
+        // 提取废料多边形
+        waste_set.polygons_with_holes(std::back_inserter(waste_regions));
+        
+        // 过滤：只保留面积足够大的废料区域
+        double min_waste_area = safe_to_double(geo::pwh_area(sheet_pwh)) * params_.min_waste_area_ratio;
+        waste_regions.erase(
+            std::remove_if(waste_regions.begin(), waste_regions.end(),
+                [&](const geo::Polygon_with_holes_2& pwh) {
+                    try {
+                        double area = safe_to_double(geo::pwh_area(pwh));
+                        return area < min_waste_area;
+                    } catch (...) {
+                        return true; // 如果计算失败，移除
+                    }
+                }),
+            waste_regions.end()
+        );
+        
+        // 按面积从大到小排序（优先使用大废料区域）
+        std::sort(waste_regions.begin(), waste_regions.end(),
+            [&](const geo::Polygon_with_holes_2& a, const geo::Polygon_with_holes_2& b) {
+                try {
+                    double area_a = safe_to_double(geo::pwh_area(a));
+                    double area_b = safe_to_double(geo::pwh_area(b));
+                    return area_a > area_b;
+                } catch (...) {
+                    return false;
+                }
+            });
+    } catch (...) {
+        // 如果计算失败，返回空列表
+        waste_regions.clear();
+    }
+    
+    return waste_regions;
+}
+
+// ============================================================================
+// 废料最小化：在废料区域生成候选点（优先在最大废料区域）
+// ============================================================================
+std::vector<geo::Point_2> CircleNesting::generate_waste_candidates(
+    size_t shape_idx,
+    const std::vector<size_t>& placed_indices,
+    const std::vector<geo::Polygon_with_holes_2>& waste_regions) const {
+    std::vector<geo::Point_2> candidates;
+    
+    if (shape_idx >= layout_.sheet_parts[0].size() || waste_regions.empty()) {
+        return candidates;
+    }
+
+    try {
+        const auto& shape = layout_.sheet_parts[0][shape_idx];
+        auto bbox = shape.transformed.bbox();
+        double shape_width = safe_to_double(bbox.xmax() - bbox.xmin());
+        double shape_height = safe_to_double(bbox.ymax() - bbox.ymin());
+        double shape_diagonal = std::sqrt(shape_width * shape_width + shape_height * shape_height);
+        
+        // 遍历废料区域（已按面积从大到小排序）
+        for (const auto& waste_region : waste_regions) {
+            if (candidates.size() >= params_.max_waste_candidates) {
+                break;
+            }
+            
+            try {
+                // 方法1：在废料区域的顶点附近生成候选点
+                for (auto v = waste_region.outer_boundary().vertices_begin();
+                     v != waste_region.outer_boundary().vertices_end(); ++v) {
+                    if (candidates.size() >= params_.max_waste_candidates) {
+                        break;
+                    }
+                    
+                    // 将零件中心放在顶点附近
+                    double x = safe_to_double(v->x()) - shape_width / 2.0;
+                    double y = safe_to_double(v->y()) - shape_height / 2.0;
+                    candidates.push_back(geo::Point_2(geo::FT(x), geo::FT(y)));
+                }
+                
+                // 方法2：在废料区域的边界上采样点
+                size_t samples_per_edge = 3;
+                for (auto e = waste_region.outer_boundary().edges_begin();
+                     e != waste_region.outer_boundary().edges_end(); ++e) {
+                    if (candidates.size() >= params_.max_waste_candidates) {
+                        break;
+                    }
+                    
+                    auto source = e->source();
+                    auto target = e->target();
+                    for (size_t s = 1; s < samples_per_edge; ++s) {
+                        double t = double(s) / samples_per_edge;
+                        double x = safe_to_double(source.x() * (1.0 - t) + target.x() * t) - shape_width / 2.0;
+                        double y = safe_to_double(source.y() * (1.0 - t) + target.y() * t) - shape_height / 2.0;
+                        candidates.push_back(geo::Point_2(geo::FT(x), geo::FT(y)));
+                    }
+                }
+                
+                // 方法3：在废料区域的质心附近生成候选点
+                try {
+                    double total_area = safe_to_double(geo::pwh_area(waste_region));
+                    if (total_area > 0) {
+                        double cx = 0.0, cy = 0.0;
+                        double weighted_sum_x = 0.0, weighted_sum_y = 0.0;
+                        
+                        // 计算外边界质心（简化：使用顶点平均）
+                        size_t vertex_count = 0;
+                        for (auto v = waste_region.outer_boundary().vertices_begin();
+                             v != waste_region.outer_boundary().vertices_end(); ++v) {
+                            cx += safe_to_double(v->x());
+                            cy += safe_to_double(v->y());
+                            vertex_count++;
+                        }
+                        if (vertex_count > 0) {
+                            cx /= vertex_count;
+                            cy /= vertex_count;
+                            
+                            // 在质心附近生成几个候选点
+                            for (int offset = -1; offset <= 1; offset += 2) {
+                                if (candidates.size() >= params_.max_waste_candidates) {
+                                    break;
+                                }
+                                double x = cx - shape_width / 2.0 + offset * shape_width * 0.1;
+                                double y = cy - shape_height / 2.0 + offset * shape_height * 0.1;
+                                candidates.push_back(geo::Point_2(geo::FT(x), geo::FT(y)));
+                            }
+                        }
+                    }
+                } catch (...) {
+                    // 如果质心计算失败，跳过
+                }
+            } catch (...) {
+                // 如果处理某个废料区域失败，继续下一个
+                continue;
+            }
+        }
+    } catch (...) {
+        // 如果生成失败，返回已生成的候选点
+    }
+    
+    return candidates;
+}
+
+// ============================================================================
+// 废料最小化：优先在废料区域放置零件
+// ============================================================================
+bool CircleNesting::place_shape_in_waste(size_t shape_idx,
+                                         const std::vector<size_t>& placed_indices,
+                                         bool try_all_rotations) {
+    if (shape_idx >= layout_.sheet_parts[0].size()) {
+        return false;
+    }
+
+    auto& shape = layout_.sheet_parts[0][shape_idx];
+    
+    try {
+        // 计算废料区域
+        auto waste_regions = calculate_waste_regions(placed_indices);
+        if (waste_regions.empty()) {
+            // 如果没有废料区域，回退到普通放置
+            return place_shape_with_nfp(shape_idx, placed_indices, try_all_rotations);
+        }
+
+        // 在废料区域生成候选点
+        auto waste_candidates = generate_waste_candidates(shape_idx, placed_indices, waste_regions);
+        if (waste_candidates.empty()) {
+            // 如果无法生成废料候选点，回退到普通放置
+            return place_shape_with_nfp(shape_idx, placed_indices, try_all_rotations);
+        }
+
+        // 尝试每个旋转角度
+        std::vector<uint32_t> rotations_to_try;
+        if (try_all_rotations && params_.try_all_rotations) {
+            size_t max_rot = std::min(static_cast<size_t>(shape.allowed_rotations),
+                                     static_cast<size_t>(params_.max_rotation_attempts));
+            for (uint32_t rot = 0; rot < max_rot; ++rot) {
+                rotations_to_try.push_back(rot);
+            }
+        } else {
+            rotations_to_try.push_back(shape.get_rotation());
+        }
+
+        uint32_t original_rotation = shape.get_rotation();
+        double radius = safe_to_double(layout_.sheets[0].diameter) / 2.0;
+        double center_x = radius;
+        double center_y = radius;
+        
+        geo::Point_2 best_point;
+        uint32_t best_rotation = shape.get_rotation();
+        double best_score = std::numeric_limits<double>::max();
+        bool found = false;
+
+        for (uint32_t rot : rotations_to_try) {
+            shape.set_rotation(rot);
+            shape.update();
+
+            // 尝试每个废料候选点
+            for (const auto& candidate : waste_candidates) {
+                auto old_x = shape.get_translate_ft_x();
+                auto old_y = shape.get_translate_ft_y();
+                
+                shape.set_translate(candidate.x(), candidate.y());
+                shape.update();
+
+                // 检查是否有效
+                if (is_valid_placement(shape_idx, placed_indices)) {
+                    // 评分：优先选择在最大废料区域的位置
+                    // 计算到圆心的距离（鼓励靠近中心）
+                    double dx = safe_to_double(candidate.x()) - center_x;
+                    double dy = safe_to_double(candidate.y()) - center_y;
+                    double dist_sq = dx * dx + dy * dy;
+                    
+                    // 优先选择靠近中心且在废料区域的位置
+                    double score = dist_sq;
+                    
+                    if (score < best_score) {
+                        best_score = score;
+                        best_point = candidate;
+                        best_rotation = rot;
+                        found = true;
+                    }
+                }
+
+                // 恢复
+                shape.set_translate(old_x, old_y);
+                shape.update();
+            }
+        }
+
+        if (found) {
+            shape.set_rotation(best_rotation);
+            shape.set_translate(best_point.x(), best_point.y());
+            shape.update();
+            return true;
+        } else {
+            // 恢复原始旋转
+            shape.set_rotation(original_rotation);
+            shape.update();
+            // 如果废料区域放置失败，回退到普通放置
+            return place_shape_with_nfp(shape_idx, placed_indices, try_all_rotations);
+        }
+    } catch (...) {
+        // 如果出错，回退到普通放置
+        return place_shape_with_nfp(shape_idx, placed_indices, try_all_rotations);
+    }
 }
 
 } // namespace nesting

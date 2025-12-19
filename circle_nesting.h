@@ -52,6 +52,11 @@ namespace nesting {
             double array_pitch_x = 0.0;           // 阵列X方向间距（0表示自动：零件宽度+间隙）
             double array_pitch_y = 0.0;           // 阵列Y方向间距（0表示自动：零件高度+间隙）
             double array_margin = 0.0;            // 阵列最外圈距离圆边的安全距离
+
+            // 废料最小化参数
+            bool use_waste_minimization = true;    // 是否启用废料区域识别与优先填充
+            double min_waste_area_ratio = 0.01;   // 最小废料区域面积比例（小于此值的废料区域忽略）
+            size_t max_waste_candidates = 50;     // 每个废料区域最多生成的候选点数
         };
 
         void set_parameters(const Parameters& params);
@@ -126,6 +131,22 @@ namespace nesting {
 
         // 更新圆直径并重建sheet
         void update_circle_diameter(double diameter);
+
+        // 废料最小化相关函数
+        // 计算当前布局的废料区域（圆 - 所有已放置零件的并集）
+        std::vector<geo::Polygon_with_holes_2> calculate_waste_regions(
+            const std::vector<size_t>& placed_indices) const;
+
+        // 在废料区域生成候选点（优先在最大废料区域）
+        std::vector<geo::Point_2> generate_waste_candidates(
+            size_t shape_idx,
+            const std::vector<size_t>& placed_indices,
+            const std::vector<geo::Polygon_with_holes_2>& waste_regions) const;
+
+        // 优先在废料区域放置零件
+        bool place_shape_in_waste(size_t shape_idx, 
+                                  const std::vector<size_t>& placed_indices,
+                                  bool try_all_rotations);
     };
 
 } // namespace nesting
