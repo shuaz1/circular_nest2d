@@ -1273,15 +1273,8 @@ bool CircleNesting::try_place_all_parts(double diameter, volatile bool* requestQ
         }
         bool placed = false;
 
-        // 优化策略：即使允许旋转，也优先尝试“保持当前朝向”放置；
-        // 只有在固定朝向无法放置时，才启用多角度旋转搜索。
         if (params_.try_all_rotations) {
-            // 1）先不旋转（只用当前rotation）尝试放置
-            placed = place_shape_with_nfp(shape_idx, placed_indices, /*try_all_rotations=*/false, requestQuit);
-            // 2）如果失败，再启用多角度旋转搜索
-            if (!placed) {
-                placed = place_shape_with_nfp(shape_idx, placed_indices, /*try_all_rotations=*/true, requestQuit);
-            }
+            placed = place_shape_with_nfp(shape_idx, placed_indices, /*try_all_rotations=*/true, requestQuit);
         } else {
             // 完全不旋转的模式，保持原有行为
             placed = place_shape_with_nfp(shape_idx, placed_indices, /*try_all_rotations=*/false, requestQuit);
@@ -1764,8 +1757,8 @@ bool CircleNesting::optimize_array_mode(double target_utilization, volatile bool
     }
 
     // 基准阵列步距：用户指定优先，否则自动 = 尺寸 + 适当间隙（取10%尺寸）
-    double gap_x = 0.1 * shape_width;
-    double gap_y = 0.1 * shape_height;
+    double gap_x = 0.0;
+    double gap_y = 0.0;
     double margin = std::max(0.0, params_.array_margin);
 
     // 构造一组候选步距缩放因子（围绕基准pitch做搜索）
@@ -1854,17 +1847,49 @@ bool CircleNesting::optimize_array_mode(double target_utilization, volatile bool
                     return da2 < db2;
                 });
 
+            std::vector<size_t> order(layout_.poly_num);
+            std::iota(order.begin(), order.end(), 0);
+            std::vector<size_t> type_key(layout_.poly_num);
+            std::vector<double> area_key(layout_.poly_num);
+            for (size_t i = 0; i < layout_.poly_num; ++i) {
+                const auto& s = layout_.sheet_parts[0][i];
+                type_key[i] = s.item_idx;
+                double a = 0.0;
+                try {
+                    if (s.base) {
+                        a = safe_to_double(geo::pwh_area(*s.base));
+                    }
+                } catch (...) {
+                    a = 0.0;
+                }
+                area_key[i] = a;
+            }
+            std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                if (type_key[a] != type_key[b]) {
+                    return type_key[a] < type_key[b];
+                }
+                return area_key[a] > area_key[b];
+            });
+
             std::vector<size_t> placed_indices;
             size_t grid_idx = 0;
 
             // 固定旋转：阵列模式一般不希望乱转，这里用当前rotation，不额外旋转
-            for (size_t i = 0; i < layout_.poly_num && grid_idx < grid_points.size(); ++i) {
+            for (size_t ord_idx = 0; ord_idx < order.size() && grid_idx < grid_points.size(); ++ord_idx) {
                 if (requestQuit && *requestQuit) {
                     break;
                 }
 
+                size_t i = order[ord_idx];
                 auto& shape = layout_.sheet_parts[0][i];
                 shape.update();
+
+                uint32_t original_rotation = shape.get_rotation();
+                size_t max_rot = std::min(static_cast<size_t>(shape.allowed_rotations),
+                                          static_cast<size_t>(params_.max_rotation_attempts));
+                if (max_rot == 0) {
+                    max_rot = 1;
+                }
 
                 for (; grid_idx < grid_points.size(); ++grid_idx) {
                     auto tx = grid_points[grid_idx].x();
@@ -1873,17 +1898,34 @@ bool CircleNesting::optimize_array_mode(double target_utilization, volatile bool
                     auto old_x = shape.get_translate_ft_x();
                     auto old_y = shape.get_translate_ft_y();
 
-                    shape.set_translate(tx, ty);
-                    shape.update();
+                    bool placed_here = false;
 
-                    if (is_valid_placement(i, placed_indices)) {
+                    for (size_t r = 0; r < max_rot; ++r) {
+                        uint32_t rot = static_cast<uint32_t>(r);
+                        if (rot == original_rotation) {
+                            shape.set_rotation(original_rotation);
+                        } else {
+                            shape.set_rotation(rot);
+                        }
+
+                        shape.set_translate(tx, ty);
+                        shape.update();
+
+                        if (is_valid_placement(i, placed_indices)) {
+                            placed_here = true;
+                            break;
+                        }
+                    }
+
+                    if (placed_here) {
                         placed_indices.push_back(i);
                         ++grid_idx;
                         break;
-                    } else {
-                        shape.set_translate(old_x, old_y);
-                        shape.update();
                     }
+
+                    shape.set_translate(old_x, old_y);
+                    shape.set_rotation(original_rotation);
+                    shape.update();
                 }
             }
 
@@ -2217,10 +2259,7 @@ std::vector<size_t> CircleNesting::schedule_best_order(double diameter, volatile
         for (size_t i = 1; i < candidate_order.size(); ++i) {
             if (requestQuit && *requestQuit) break;
             size_t shape_idx = candidate_order[i];
-            bool placed = place_shape_with_nfp(shape_idx, placed_indices, false, requestQuit);
-            if (!placed && params_.try_all_rotations) {
-                placed = place_shape_with_nfp(shape_idx, placed_indices, true, requestQuit);
-            }
+            bool placed = place_shape_with_nfp(shape_idx, placed_indices, params_.try_all_rotations, requestQuit);
             if (placed) {
                 placed_indices.push_back(shape_idx);
 
