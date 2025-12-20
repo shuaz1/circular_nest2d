@@ -2078,6 +2078,62 @@ void CircleNesting::local_flip_micro_shift_repair(volatile bool* requestQuit,
                 candidates_for_rot.clear();
             }
 
+            // 邻居方向/垂直方向微网格候选点：用于打破“同向畴”，促进正反咬合
+            try {
+                const double r = radius;
+                const double cx0 = r;
+                const double cy0 = r;
+                auto bbox_r = shape.transformed.bbox();
+                double w = safe_to_double(bbox_r.xmax() - bbox_r.xmin());
+                double h = safe_to_double(bbox_r.ymax() - bbox_r.ymin());
+                double diag = std::sqrt(w * w + h * h);
+                double step = std::max(1e-9, std::min(diag * 0.18, r * 0.03));
+                double step2 = step * 0.55;
+
+                const double ox = safe_to_double(shape.get_translate_ft_x());
+                const double oy = safe_to_double(shape.get_translate_ft_y());
+
+                double ux = dir_unit.first;
+                double uy = dir_unit.second;
+                double px = -uy;
+                double py = ux;
+
+                auto try_push = [&](double x, double y) {
+                    geo::Point_2 p{ geo::FT(x), geo::FT(y) };
+                    // IFR 过滤
+                    try {
+                        if (ifr.bounded_side(p) == CGAL::ON_UNBOUNDED_SIDE) {
+                            return;
+                        }
+                    } catch (...) {
+                        // 若 bounded_side 失败则不添加
+                        return;
+                    }
+                    // 圆内过滤（用中心点近似）
+                    double dx = x - cx0;
+                    double dy = y - cy0;
+                    if (dx * dx + dy * dy > r * r) {
+                        return;
+                    }
+                    candidates_for_rot.push_back(p);
+                };
+
+                // 沿邻居方向推进/后退 + 垂直微移（形成“咬合”常见形态）
+                const double k1[2] = { step, step2 };
+                for (double s : k1) {
+                    try_push(ox + ux * s, oy + uy * s);
+                    try_push(ox - ux * s, oy - uy * s);
+                    try_push(ox + px * s, oy + py * s);
+                    try_push(ox - px * s, oy - py * s);
+
+                    try_push(ox + ux * s + px * step2, oy + uy * s + py * step2);
+                    try_push(ox + ux * s - px * step2, oy + uy * s - py * step2);
+                    try_push(ox - ux * s + px * step2, oy - uy * s + py * step2);
+                    try_push(ox - ux * s - px * step2, oy - uy * s - py * step2);
+                }
+            } catch (...) {
+            }
+
             if (candidates_for_rot.empty()) {
                 continue;
             }
