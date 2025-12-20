@@ -165,6 +165,129 @@ bool CircleNesting::should_stop(volatile bool* requestQuit) const {
     return false;
 }
 
+bool CircleNesting::cgal_validate_no_overlap_for_parts(const std::vector<TransformedShape>& parts,
+                                                        volatile bool* requestQuit) const {
+    if (parts.empty()) {
+        return true;
+    }
+
+    const double radius = safe_to_double(layout_.sheets[0].diameter) / 2.0;
+    const double center_x = radius;
+    const double center_y = radius;
+    const double radius_sq = radius * radius;
+
+    std::vector<size_t> active;
+    active.reserve(parts.size());
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (should_stop(requestQuit)) {
+            return false;
+        }
+        try {
+            auto bbox = parts[i].transformed.bbox();
+            double cx = safe_to_double(bbox.xmin() + bbox.xmax()) / 2.0;
+            double cy = safe_to_double(bbox.ymin() + bbox.ymax()) / 2.0;
+            double dist_sq = (cx - center_x) * (cx - center_x) + (cy - center_y) * (cy - center_y);
+            if (dist_sq > radius_sq * 1.5) {
+                continue;
+            }
+            active.push_back(i);
+        } catch (...) {
+            continue;
+        }
+    }
+
+    const double overlap_tolerance = 1e-12;
+    for (size_t ai = 0; ai < active.size(); ++ai) {
+        if (should_stop(requestQuit)) {
+            return false;
+        }
+        size_t i = active[ai];
+        auto bbox_i = parts[i].transformed.bbox();
+
+        for (size_t aj = ai + 1; aj < active.size(); ++aj) {
+            if (should_stop(requestQuit)) {
+                return false;
+            }
+            size_t j = active[aj];
+            auto bbox_j = parts[j].transformed.bbox();
+            if (bbox_i.xmax() < bbox_j.xmin() || bbox_i.xmin() > bbox_j.xmax() ||
+                bbox_i.ymax() < bbox_j.ymin() || bbox_i.ymin() > bbox_j.ymax()) {
+                continue;
+            }
+
+            try {
+                geo::Polygon_set_2 ps1(geo::traits);
+                ps1.insert(parts[i].transformed.outer_boundary());
+
+                geo::Polygon_set_2 ps2(geo::traits);
+                ps2.insert(parts[j].transformed.outer_boundary());
+
+                ps1.intersection(ps2);
+                if (ps1.is_empty()) {
+                    continue;
+                }
+
+                std::vector<geo::Polygon_with_holes_2> intersection;
+                intersection.reserve(4);
+                ps1.polygons_with_holes(std::back_inserter(intersection));
+
+                double overlap_area = 0.0;
+                for (const auto& p : intersection) {
+                    overlap_area += safe_to_double(geo::pwh_area(p));
+                    if (overlap_area > overlap_tolerance) {
+                        return false;
+                    }
+                }
+            } catch (...) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+void CircleNesting::rollback_to_last_validated_best() {
+    if (!have_validated_best_ || last_validated_best_result_.empty()) {
+        return;
+    }
+    layout_.sheet_parts = last_validated_best_result_;
+    layout_.best_result = last_validated_best_result_;
+    layout_.best_utilization = last_validated_best_utilization_;
+    best_utilization_ = last_validated_best_utilization_;
+}
+
+void CircleNesting::maybe_cgal_validate_and_checkpoint_best(volatile bool* requestQuit) {
+    if (params_.geometry_library != Parameters::GeometryLibrary::Clipper) {
+        return;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    if (next_cgal_validation_time_.time_since_epoch().count() == 0) {
+        next_cgal_validation_time_ = now;
+    }
+
+    if (now < next_cgal_validation_time_) {
+        return;
+    }
+
+    next_cgal_validation_time_ = now + std::chrono::seconds(10);
+
+    if (layout_.best_result.empty() || layout_.best_result[0].empty()) {
+        return;
+    }
+
+    bool ok = cgal_validate_no_overlap_for_parts(layout_.best_result[0], requestQuit);
+    if (ok) {
+        have_validated_best_ = true;
+        last_validated_best_utilization_ = layout_.best_utilization;
+        last_validated_best_result_ = layout_.best_result;
+        return;
+    }
+
+    rollback_to_last_validated_best();
+}
+
 void CircleNesting::set_parameters(const Parameters& params) {
     params_ = params;
 }
@@ -282,7 +405,7 @@ double CircleNesting::calculate_utilization() const {
                                 try {
                                     union_area += geo::GeometryOperations::area(poly);
                                 } catch (...) {
-                                    // 忽略单个错误
+                                    // 忽略错误
                                 }
                             }
                         }
@@ -293,7 +416,7 @@ double CircleNesting::calculate_utilization() const {
                             try {
                                 union_area += geo::GeometryOperations::area(poly);
                             } catch (...) {
-                                // 忽略单个错误
+                                // 忽略错误
                             }
                         }
                     }
@@ -1043,21 +1166,46 @@ bool CircleNesting::place_shape_with_nfp(size_t shape_idx,
         double best_score = std::numeric_limits<double>::max();
         bool found = false;
 
+        uint32_t original_rotation = shape.get_rotation();
+        const uint32_t allowed_for_bias = std::max<uint32_t>(1, shape.allowed_rotations);
+
         // 如果需要尝试所有旋转角度
         std::vector<uint32_t> rotations_to_try;
         if (try_all_rotations && params_.try_all_rotations) {
             // 尝试所有允许的旋转角度（如果allowed_rotations=4，则尝试0°, 90°, 180°, 270°）
             // 但不超过max_rotation_attempts限制（避免旋转次数过多）
-            size_t max_rot = std::min(static_cast<size_t>(shape.allowed_rotations), 
-                                     static_cast<size_t>(params_.max_rotation_attempts));
-            for (uint32_t rot = 0; rot < max_rot; ++rot) {
-                rotations_to_try.push_back(rot);
+            const uint32_t allowed = std::max<uint32_t>(1, shape.allowed_rotations);
+            const size_t max_rot = std::min(static_cast<size_t>(allowed),
+                                            static_cast<size_t>(std::max<size_t>(1, params_.max_rotation_attempts)));
+            auto push_unique = [&](uint32_t r) {
+                r = r % allowed;
+                if (std::find(rotations_to_try.begin(), rotations_to_try.end(), r) == rotations_to_try.end()) {
+                    rotations_to_try.push_back(r);
+                }
+            };
+
+            if (allowed >= 2) {
+                push_unique(original_rotation);
+                push_unique(original_rotation + allowed / 2);
+            } else {
+                push_unique(original_rotation);
+            }
+            push_unique(0);
+            if (allowed >= 4) {
+                push_unique(allowed / 4);
+                push_unique((allowed * 3) / 4);
+            }
+
+            for (uint32_t rot = 0; rotations_to_try.size() < max_rot && rot < allowed; ++rot) {
+                push_unique(rot);
+            }
+
+            if (rotations_to_try.size() > max_rot) {
+                rotations_to_try.resize(max_rot);
             }
         } else {
-            rotations_to_try.push_back(shape.get_rotation());
+            rotations_to_try.push_back(original_rotation);
         }
-
-        uint32_t original_rotation = shape.get_rotation();
         
         // 对每个零件限制总尝试次数，避免在单个零件上耗费过多时间
         const size_t max_total_attempts_per_shape =
@@ -1083,6 +1231,17 @@ bool CircleNesting::place_shape_with_nfp(size_t shape_idx,
             std::vector<geo::Point_2> candidates_for_rotation = candidates;
             if (rot != original_rotation) {
                 candidates_for_rotation = generate_circular_candidates(shape_idx, placed_indices, ifr_rotated);
+            }
+
+            double neighbor_threshold = 0.0;
+            try {
+                auto bbox_r = shape.transformed.bbox();
+                double w = safe_to_double(bbox_r.xmax() - bbox_r.xmin());
+                double h = safe_to_double(bbox_r.ymax() - bbox_r.ymin());
+                double diag = std::sqrt(w * w + h * h);
+                neighbor_threshold = std::max(1e-9, diag * 3.5);
+            } catch (...) {
+                neighbor_threshold = 0.0;
             }
 
             for (const auto& candidate : candidates_for_rotation) {
@@ -1114,20 +1273,36 @@ bool CircleNesting::place_shape_with_nfp(size_t shape_idx,
                     // 优先选择靠近中心的位置
                     double score = dist_sq;
                     
-                    // 如果启用紧凑位置优先，进一步优化评分
-                    if (params_.prioritize_compact_positions) {
-                        // 计算到最近已放置零件的距离（鼓励填充空隙）
-                        double min_dist_to_placed = std::numeric_limits<double>::max();
-                        for (size_t j : placed_indices) {
-                            auto bbox_j = layout_.sheet_parts[0][j].transformed.bbox();
-                            double cx_j = safe_to_double(bbox_j.xmin() + bbox_j.xmax()) / 2.0;
-                            double cy_j = safe_to_double(bbox_j.ymin() + bbox_j.ymax()) / 2.0;
-                            double dist_to_j = std::sqrt((dx + center_x - cx_j) * (dx + center_x - cx_j) + 
-                                                          (dy + center_y - cy_j) * (dy + center_y - cy_j));
-                            min_dist_to_placed = std::min(min_dist_to_placed, dist_to_j);
+                    double min_dist_to_placed = std::numeric_limits<double>::max();
+                    double nearest_same_dist = std::numeric_limits<double>::max();
+                    uint32_t nearest_same_rotation = 0;
+                    for (size_t j : placed_indices) {
+                        auto bbox_j = layout_.sheet_parts[0][j].transformed.bbox();
+                        double cx_j = safe_to_double(bbox_j.xmin() + bbox_j.xmax()) / 2.0;
+                        double cy_j = safe_to_double(bbox_j.ymin() + bbox_j.ymax()) / 2.0;
+                        double dist_to_j = std::sqrt((dx + center_x - cx_j) * (dx + center_x - cx_j) +
+                                                      (dy + center_y - cy_j) * (dy + center_y - cy_j));
+                        min_dist_to_placed = std::min(min_dist_to_placed, dist_to_j);
+
+                        if (layout_.sheet_parts[0][j].item_idx == shape.item_idx) {
+                            if (dist_to_j < nearest_same_dist) {
+                                nearest_same_dist = dist_to_j;
+                                nearest_same_rotation = layout_.sheet_parts[0][j].get_rotation();
+                            }
                         }
-                        // 鼓励填充小空隙
+                    }
+
+                    if (params_.prioritize_compact_positions) {
                         score = dist_sq * 0.7 + min_dist_to_placed * 0.3;
+                    }
+
+                    if (allowed_for_bias >= 2 && neighbor_threshold > 0.0 &&
+                        nearest_same_dist < neighbor_threshold) {
+                        uint32_t desired = (nearest_same_rotation + allowed_for_bias / 2) % allowed_for_bias;
+                        const double bias = 2e-3 * (radius * radius + 1.0);
+                        if ((rot % allowed_for_bias) != desired) {
+                            score += bias;
+                        }
                     }
                     
                     if (score < best_score) {
@@ -1417,6 +1592,8 @@ void CircleNesting::compact_layout(size_t iterations, volatile bool* requestQuit
                 if (placed_better && is_valid_placement(idx, other_indices)) {
                     double new_util = calculate_utilization();
                     double delta = new_util - current_utilization;
+                    
+                    // 接受改进或按概率接受次优解（模拟退火）
                     bool accept = false;
                     if (delta > 0) {
                         accept = true;
@@ -1431,7 +1608,7 @@ void CircleNesting::compact_layout(size_t iterations, volatile bool* requestQuit
                             accept = true;
                         }
                     }
-
+                    
                     if (!accept) {
                         shape.set_rotation(old_rot);
                         shape.set_translate(old_x, old_y);
@@ -1633,316 +1810,410 @@ void CircleNesting::compact_layout(size_t iterations, volatile bool* requestQuit
     }
 }
 
-bool CircleNesting::optimize_diameter(double target_utilization, volatile bool* requestQuit,
-                                     std::function<void(const Layout&)> progress_callback) {
-    double theoretical_min = calculate_theoretical_min_diameter();
-    double current_diameter = safe_to_double(layout_.sheets[0].diameter);
-    
-    double best_diameter = current_diameter;
-    double best_util = 0.0;
-    double min_diameter = theoretical_min * params_.min_diameter_ratio;
-    
-    if (params_.use_binary_search) {
-        // 使用二分查找优化直径
-        best_diameter = binary_search_diameter(min_diameter, current_diameter, 
-                                              target_utilization, requestQuit, progress_callback);
-        best_util = layout_.best_utilization;
-    } else {
-        // 线性搜索（保留作为备选）
-        double step = current_diameter * params_.diameter_step_ratio;
-        
-        for (size_t iter = 0; iter < params_.diameter_optimization_iterations; ++iter) {
+void CircleNesting::local_flip_micro_shift_repair(volatile bool* requestQuit,
+                                                   std::function<void(const Layout&)>* progress_callback) {
+    if (layout_.sheet_parts.empty() || layout_.sheet_parts[0].empty()) {
+        qWarning() << "[LOCAL_REPAIR] skip: empty parts";
+        return;
+    }
+
+    const double radius = safe_to_double(layout_.sheets[0].diameter) / 2.0;
+    const double center_x = radius;
+    const double center_y = radius;
+    const double radius_sq = radius * radius;
+    const double compactness_eps = std::max(1e-9, radius * 0.002);
+
+    qWarning() << "[LOCAL_REPAIR] begin: poly_num=" << layout_.poly_num
+               << ", radius=" << radius
+               << ", eps=" << compactness_eps;
+
+    std::vector<std::pair<double, size_t>> small_candidates;
+    small_candidates.reserve(layout_.poly_num);
+    for (size_t i = 0; i < layout_.poly_num; ++i) {
+        if (should_stop(requestQuit)) {
+            qWarning() << "[LOCAL_REPAIR] abort: should_stop during candidate scan";
+            return;
+        }
+        try {
+            auto bbox = layout_.sheet_parts[0][i].transformed.bbox();
+            double cx = safe_to_double(bbox.xmin() + bbox.xmax()) / 2.0;
+            double cy = safe_to_double(bbox.ymin() + bbox.ymax()) / 2.0;
+            double dist_sq = (cx - center_x) * (cx - center_x) + (cy - center_y) * (cy - center_y);
+            if (dist_sq >= radius_sq * 1.21) {
+                continue;
+            }
+            double w = safe_to_double(bbox.xmax() - bbox.xmin());
+            double h = safe_to_double(bbox.ymax() - bbox.ymin());
+            double area_proxy = std::max(0.0, w * h);
+            small_candidates.push_back({ area_proxy, i });
+        } catch (...) {
+        }
+    }
+
+    if (small_candidates.size() < 2) {
+        qWarning() << "[LOCAL_REPAIR] skip: small_candidates<2";
+        return;
+    }
+
+    std::sort(small_candidates.begin(), small_candidates.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    std::vector<size_t> active;
+    active.reserve(small_candidates.size());
+    size_t pick = static_cast<size_t>(std::ceil(static_cast<double>(small_candidates.size()) * 0.2));
+    pick = std::max<size_t>(pick, 30);
+    pick = std::min<size_t>(pick, 200);
+    pick = std::min<size_t>(pick, small_candidates.size());
+    for (size_t k = 0; k < pick; ++k) {
+        active.push_back(small_candidates[k].second);
+    }
+
+    qWarning() << "[LOCAL_REPAIR] picked=" << active.size() << " of small_candidates=" << small_candidates.size();
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::shuffle(active.begin(), active.end(), gen);
+
+    const size_t max_shapes = std::min<size_t>(active.size(), 200);
+    const size_t max_candidates_per_rot = 300;
+
+    auto compactness = [&]() -> double {
+        double max_r = 0.0;
+        try {
+            for (const auto& s : layout_.sheet_parts[0]) {
+                auto bb = s.transformed.bbox();
+                double xs[2] = { safe_to_double(bb.xmin()), safe_to_double(bb.xmax()) };
+                double ys[2] = { safe_to_double(bb.ymin()), safe_to_double(bb.ymax()) };
+                for (double x : xs) {
+                    for (double y : ys) {
+                        double dx = x - center_x;
+                        double dy = y - center_y;
+                        double r = std::sqrt(dx * dx + dy * dy);
+                        if (r > max_r) max_r = r;
+                    }
+                }
+            }
+        } catch (...) {
+        }
+        return max_r;
+    };
+
+    auto local_score = [&](size_t idx, const std::vector<size_t>& others) -> double {
+        try {
+            const auto& shape = layout_.sheet_parts[0][idx];
+            auto bbox = shape.transformed.bbox();
+            double cx = safe_to_double(bbox.xmin() + bbox.xmax()) / 2.0;
+            double cy = safe_to_double(bbox.ymin() + bbox.ymax()) / 2.0;
+            double dx = cx - center_x;
+            double dy = cy - center_y;
+            double dist_sq = dx * dx + dy * dy;
+
+            double min_dist = std::numeric_limits<double>::max();
+            double nearest_same_dist = std::numeric_limits<double>::max();
+            uint32_t nearest_same_rotation = 0;
+            for (size_t j : others) {
+                const auto& s = layout_.sheet_parts[0][j];
+                auto bb = s.transformed.bbox();
+                double cxx = safe_to_double(bb.xmin() + bb.xmax()) / 2.0;
+                double cyy = safe_to_double(bb.ymin() + bb.ymax()) / 2.0;
+                double d = std::sqrt((cx - cxx) * (cx - cxx) + (cy - cyy) * (cy - cyy));
+                min_dist = std::min(min_dist, d);
+                if (s.item_idx == shape.item_idx) {
+                    if (d < nearest_same_dist) {
+                        nearest_same_dist = d;
+                        nearest_same_rotation = s.get_rotation();
+                    }
+                }
+            }
+
+            double score = dist_sq * 0.7 + min_dist * 0.3;
+            const uint32_t allowed = std::max<uint32_t>(1, shape.allowed_rotations);
+            if (allowed >= 2) {
+                double neighbor_threshold = 0.0;
+                try {
+                    double w = safe_to_double(bbox.xmax() - bbox.xmin());
+                    double h = safe_to_double(bbox.ymax() - bbox.ymin());
+                    double diag = std::sqrt(w * w + h * h);
+                    neighbor_threshold = std::max(1e-9, diag * 3.5);
+                } catch (...) {
+                    neighbor_threshold = 0.0;
+                }
+
+                if (neighbor_threshold > 0.0 && nearest_same_dist < neighbor_threshold) {
+                    uint32_t desired = (nearest_same_rotation + allowed / 2) % allowed;
+                    if ((shape.get_rotation() % allowed) != desired) {
+                        score += 2e-3 * (radius * radius + 1.0);
+                    }
+                }
+            }
+
+            return score;
+        } catch (...) {
+            return std::numeric_limits<double>::max();
+        }
+    };
+
+    auto center_of = [&](size_t idx) -> std::pair<double, double> {
+        try {
+            const auto& s = layout_.sheet_parts[0][idx];
+            auto bb = s.transformed.bbox();
+            double cx = safe_to_double(bb.xmin() + bb.xmax()) / 2.0;
+            double cy = safe_to_double(bb.ymin() + bb.ymax()) / 2.0;
+            return { cx, cy };
+        } catch (...) {
+            return { 0.0, 0.0 };
+        }
+    };
+
+    auto nearest_same_dist = [&](size_t idx, const std::vector<size_t>& others,
+                                 std::pair<double, double>* dir_unit) -> double {
+        double best = std::numeric_limits<double>::max();
+        try {
+            const auto& s0 = layout_.sheet_parts[0][idx];
+            auto c0 = center_of(idx);
+            double best_dx = 0.0;
+            double best_dy = 0.0;
+            uint32_t best_rot = 0;
+            for (size_t j : others) {
+                const auto& s = layout_.sheet_parts[0][j];
+                if (s.item_idx != s0.item_idx) {
+                    continue;
+                }
+                auto cj = center_of(j);
+                double dx = cj.first - c0.first;
+                double dy = cj.second - c0.second;
+                double d = std::sqrt(dx * dx + dy * dy);
+                if (d < best) {
+                    best = d;
+                    best_dx = dx;
+                    best_dy = dy;
+                    best_rot = s.get_rotation();
+                }
+            }
+            if (dir_unit) {
+                if (best < std::numeric_limits<double>::max() && best > 1e-12) {
+                    (*dir_unit) = { best_dx / best, best_dy / best };
+                } else {
+                    (*dir_unit) = { 0.0, 0.0 };
+                }
+            }
+        } catch (...) {
+            if (dir_unit) {
+                (*dir_unit) = { 0.0, 0.0 };
+            }
+        }
+        return best;
+    };
+
+    double comp_initial = compactness();
+    double comp_current = comp_initial;
+
+    size_t accepted = 0;
+    for (size_t k = 0; k < max_shapes; ++k) {
+        if (should_stop(requestQuit)) {
+            qWarning() << "[LOCAL_REPAIR] abort: should_stop during search";
+            break;
+        }
+
+        size_t idx = active[k];
+        auto& shape = layout_.sheet_parts[0][idx];
+        const uint32_t allowed = std::max<uint32_t>(1, shape.allowed_rotations);
+        if (allowed < 2) {
+            continue;
+        }
+
+        std::vector<size_t> others;
+        others.reserve(layout_.poly_num > 0 ? (layout_.poly_num - 1) : 0);
+        for (size_t j = 0; j < layout_.poly_num; ++j) {
+            if (j != idx) {
+                others.push_back(j);
+            }
+        }
+
+        const auto old_x = shape.get_translate_ft_x();
+        const auto old_y = shape.get_translate_ft_y();
+        const uint32_t old_rot = shape.get_rotation();
+
+        double comp_before_move = comp_current;
+
+        double score_before = local_score(idx, others);
+        std::pair<double, double> dir_unit{ 0.0, 0.0 };
+        double same_before = nearest_same_dist(idx, others, &dir_unit);
+
+        double best_score = score_before;
+        double best_same = same_before;
+        double best_comp = comp_before_move;
+        geo::FT best_x = old_x;
+        geo::FT best_y = old_y;
+        uint32_t best_rot = old_rot;
+
+        uint32_t rot_a = old_rot % allowed;
+        uint32_t rot_b = (rot_a + allowed / 2) % allowed;
+
+        for (uint32_t rot_try : { rot_b, rot_a }) {
             if (should_stop(requestQuit)) {
                 break;
             }
+            shape.set_rotation(rot_try);
+            shape.update();
 
-            double test_diameter = current_diameter - step * iter;
-            if (test_diameter < min_diameter) {
-                break;
+            auto ifr = geo::comp_ifr(layout_.sheets[0].sheet, shape.transformed);
+            if (ifr.is_empty()) {
+                continue;
             }
 
-            if (try_place_all_parts(test_diameter, requestQuit, &progress_callback)) {
-                // 如果用户已经请求退出，不再进入耗时的紧凑化阶段
+            std::vector<geo::Point_2> candidates_for_rot;
+            try {
+                candidates_for_rot = generate_circular_candidates(idx, others, ifr);
+            } catch (...) {
+                candidates_for_rot.clear();
+            }
+
+            if (candidates_for_rot.empty()) {
+                continue;
+            }
+
+            {
+                const double ox = safe_to_double(old_x);
+                const double oy = safe_to_double(old_y);
+                const auto c0 = center_of(idx);
+                const double step_to_neighbor = (same_before < std::numeric_limits<double>::max()) ?
+                                                std::min(same_before, radius * 0.5) : 0.0;
+                const double tx = c0.first + dir_unit.first * step_to_neighbor;
+                const double ty = c0.second + dir_unit.second * step_to_neighbor;
+
+                std::sort(candidates_for_rot.begin(), candidates_for_rot.end(),
+                          [&](const geo::Point_2& a, const geo::Point_2& b) {
+                              double ax = safe_to_double(a.x());
+                              double ay = safe_to_double(a.y());
+                              double bx = safe_to_double(b.x());
+                              double by = safe_to_double(b.y());
+
+                              double da0x = ax - ox;
+                              double da0y = ay - oy;
+                              double db0x = bx - ox;
+                              double db0y = by - oy;
+                              double d0a = da0x * da0x + da0y * da0y;
+                              double d0b = db0x * db0x + db0y * db0y;
+
+                              double datx = ax - tx;
+                              double daty = ay - ty;
+                              double dbtx = bx - tx;
+                              double dbty = by - ty;
+                              double dta = datx * datx + daty * daty;
+                              double dtb = dbtx * dbtx + dbty * dbty;
+
+                              return (d0a * 0.7 + dta * 0.3) < (d0b * 0.7 + dtb * 0.3);
+                          });
+            }
+
+            const size_t limit = std::min(max_candidates_per_rot, candidates_for_rot.size());
+            for (size_t ci = 0; ci < limit; ++ci) {
                 if (should_stop(requestQuit)) {
                     break;
                 }
 
-                compact_layout(params_.compact_iterations, requestQuit, &progress_callback);
-                
-                double util = calculate_utilization();
-                
-                if (util > best_util) {
-                    best_util = util;
-                    best_diameter = test_diameter;
-                    
-                    layout_.best_result = layout_.sheet_parts;
-                    layout_.best_utilization = util;
-                    
-                    if (progress_callback) {
-                        progress_callback(layout_);
-                    }
+                shape.set_translate(candidates_for_rot[ci].x(), candidates_for_rot[ci].y());
+                shape.update();
+
+                if (!is_valid_placement(idx, others)) {
+                    continue;
                 }
-                
-                if (util >= target_utilization) {
-                    update_circle_diameter(best_diameter);
-                    return true;
+
+                double comp_try = compactness();
+                if (comp_try > comp_before_move + compactness_eps * 2.0) {
+                    continue;
+                }
+
+                double score_try = local_score(idx, others);
+                double same_try = nearest_same_dist(idx, others, nullptr);
+
+                bool better = false;
+                if (same_try + 1e-9 < best_same) {
+                    better = true;
+                } else if (score_try + 1e-12 < best_score) {
+                    better = true;
+                } else if (comp_try + 1e-9 < best_comp) {
+                    better = true;
+                }
+
+                if (better) {
+                    best_comp = comp_try;
+                    best_score = score_try;
+                    best_same = same_try;
+                    best_rot = rot_try;
+                    best_x = shape.get_translate_ft_x();
+                    best_y = shape.get_translate_ft_y();
                 }
             }
         }
+
+        shape.set_rotation(best_rot);
+        shape.set_translate(best_x, best_y);
+        shape.update();
+
+        if (!is_valid_placement(idx, others)) {
+            shape.set_rotation(old_rot);
+            shape.set_translate(old_x, old_y);
+            shape.update();
+            continue;
+        }
+
+        if (best_rot == old_rot && best_x == old_x && best_y == old_y) {
+            continue;
+        }
+
+        double comp_after_move = compactness();
+        double score_after = local_score(idx, others);
+        double same_after = nearest_same_dist(idx, others, nullptr);
+        if (comp_after_move > comp_before_move + compactness_eps ||
+            !((same_after + 1e-9 < same_before) || (score_after + 1e-12 < score_before))) {
+            shape.set_rotation(old_rot);
+            shape.set_translate(old_x, old_y);
+            shape.update();
+            continue;
+        }
+
+        comp_current = comp_after_move;
+
+        ++accepted;
+        if (accepted % 25 == 0 && progress_callback) {
+            double util_now = 0.0;
+            try {
+                util_now = calculate_utilization();
+            } catch (...) {
+                util_now = 0.0;
+            }
+            if (util_now > best_utilization_) {
+                best_utilization_ = util_now;
+                layout_.best_utilization = best_utilization_;
+                layout_.best_result = layout_.sheet_parts;
+            }
+            (*progress_callback)(layout_);
+        }
     }
 
-    // 使用最佳直径，进行最终优化
-    if (best_util > 0) {
-        update_circle_diameter(best_diameter);
-        if (!try_place_all_parts(best_diameter, requestQuit, &progress_callback)) {
-            return false;
-        }
-
-        // 如果此时已经请求退出，就不要再进入最终紧凑化，直接用当前结果
-        if (!should_stop(requestQuit)) {
-            // 最终紧凑化（使用更多迭代）
-            compact_layout(params_.compact_iterations, requestQuit, &progress_callback);
-        }
-
-        best_utilization_ = calculate_utilization();
-        layout_.best_utilization = best_utilization_;
-        layout_.best_result = layout_.sheet_parts;
-        
-        if (progress_callback) {
-            progress_callback(layout_);
-        }
-        
-        return best_utilization_ >= target_utilization;
+    if (progress_callback && comp_current + 1e-9 < comp_initial) {
+        (*progress_callback)(layout_);
     }
 
-    return false;
+    qWarning() << "[LOCAL_REPAIR] end: tried=" << max_shapes
+               << ", accepted=" << accepted
+               << ", compactness=" << comp_initial << "->" << comp_current;
 }
 
 bool CircleNesting::optimize_array_mode(double target_utilization, volatile bool* requestQuit,
                                         std::function<void(const Layout&)> progress_callback) {
-    // 阵列模式：在当前直径下，通过搜索一组候选步距(pitch)，
-    // 近似寻找“放件数尽量多、利用率尽量高”的周期阵列（简化版最小阵列思想）。
-    if (layout_.sheet_parts.empty() || layout_.sheet_parts[0].empty()) {
+    double diameter = safe_to_double(layout_.sheets[0].diameter);
+    if (diameter <= 0.0) {
         return false;
     }
 
-    double radius = safe_to_double(layout_.sheets[0].diameter) / 2.0;
-    double center_x = radius;
-    double center_y = radius;
+    const double prev_best_util = best_utilization_;
+    const auto prev_best_result = layout_.best_result;
 
-    // 选第一个零件作为阵列单元的尺寸参考（假定大部分零件尺寸相近）
-    const auto& first_shape = layout_.sheet_parts[0][0];
-    geo::Polygon_with_holes_2 base_poly = *first_shape.base;
-    auto bbox = base_poly.outer_boundary().bbox();
-    double shape_width = safe_to_double(bbox.xmax() - bbox.xmin());
-    double shape_height = safe_to_double(bbox.ymax() - bbox.ymin());
-    if (shape_width <= 0 || shape_height <= 0) {
-        return false;
-    }
-
-    // 基准阵列步距：用户指定优先，否则自动 = 尺寸 + 适当间隙（取10%尺寸）
-    double gap_x = 0.0;
-    double gap_y = 0.0;
-    double margin = std::max(0.0, params_.array_margin);
-
-    // 构造一组候选步距缩放因子（围绕基准pitch做搜索）
-    std::vector<double> scale_candidates = { 0.9, 1.0, 1.1 };
-    double base_pitch_x = (params_.array_pitch_x > 0.0) ? params_.array_pitch_x : (shape_width + gap_x);
-    double base_pitch_y = (params_.array_pitch_y > 0.0) ? params_.array_pitch_y : (shape_height + gap_y);
-    if (base_pitch_x <= 0 || base_pitch_y <= 0) {
-        return false;
-    }
-
-    // 备份初始布局（仅关心 sheet_parts）
-    auto original_parts = layout_.sheet_parts;
-
-    double best_util = 0.0;
-    size_t best_placed_count = 0;
-    std::vector<std::vector<TransformedShape>> best_parts;
-
-    for (double sx : scale_candidates) {
-        for (double sy : scale_candidates) {
-            if (requestQuit && *requestQuit) {
-                break;
-            }
-
-            double pitch_x = base_pitch_x * sx;
-            double pitch_y = base_pitch_y * sy;
-            if (pitch_x <= 0 || pitch_y <= 0) {
-                continue;
-            }
-
-            // 还原布局
-            layout_.sheet_parts = original_parts;
-
-            // 先把所有零件移到板外，避免视觉干扰
-            double outside_offset = -radius * 2.0;
-            for (auto& shape : layout_.sheet_parts[0]) {
-                shape.set_translate(geo::FT(outside_offset), geo::FT(outside_offset));
-                shape.update();
-            }
-
-            // 为当前 pitch 生成阵列格点
-            std::vector<geo::Point_2> grid_points;
-            int max_ix = static_cast<int>(std::ceil((radius - margin) / pitch_x)) + 2;
-            int max_iy = static_cast<int>(std::ceil((radius - margin) / pitch_y)) + 2;
-
-            for (int iy = -max_iy; iy <= max_iy; ++iy) {
-                for (int ix = -max_ix; ix <= max_ix; ++ix) {
-                    double gx = center_x + ix * pitch_x;
-                    double gy = center_y + iy * pitch_y;
-
-                    double tx = gx - shape_width / 2.0;
-                    double ty = gy - shape_height / 2.0;
-
-                    double corners_x[2] = { tx, tx + shape_width };
-                    double corners_y[2] = { ty, ty + shape_height };
-                    double max_dist_sq = 0.0;
-                    for (int cx_i = 0; cx_i < 2; ++cx_i) {
-                        for (int cy_i = 0; cy_i < 2; ++cy_i) {
-                            double dx = corners_x[cx_i] - center_x;
-                            double dy = corners_y[cy_i] - center_y;
-                            double d2 = dx * dx + dy * dy;
-                            if (d2 > max_dist_sq) {
-                                max_dist_sq = d2;
-                            }
-                        }
-                    }
-                    double limit_r = std::max(0.0, radius - margin);
-                    if (max_dist_sq <= limit_r * limit_r) {
-                        grid_points.emplace_back(geo::FT(tx), geo::FT(ty));
-                    }
-                }
-            }
-
-            if (grid_points.empty()) {
-                continue;
-            }
-
-            // 按“离圆心距离”排序，优先内部格点
-            std::sort(grid_points.begin(), grid_points.end(),
-                [&](const geo::Point_2& a, const geo::Point_2& b) {
-                    double ax = safe_to_double(a.x()) + shape_width / 2.0;
-                    double ay = safe_to_double(a.y()) + shape_height / 2.0;
-                    double bx = safe_to_double(b.x()) + shape_width / 2.0;
-                    double by = safe_to_double(b.y()) + shape_height / 2.0;
-                    double da2 = (ax - center_x) * (ax - center_x) + (ay - center_y) * (ay - center_y);
-                    double db2 = (bx - center_x) * (bx - center_x) + (by - center_y) * (by - center_y);
-                    return da2 < db2;
-                });
-
-            std::vector<size_t> order(layout_.poly_num);
-            std::iota(order.begin(), order.end(), 0);
-            std::vector<size_t> type_key(layout_.poly_num);
-            std::vector<double> area_key(layout_.poly_num);
-            for (size_t i = 0; i < layout_.poly_num; ++i) {
-                const auto& s = layout_.sheet_parts[0][i];
-                type_key[i] = s.item_idx;
-                double a = 0.0;
-                try {
-                    if (s.base) {
-                        a = safe_to_double(geo::pwh_area(*s.base));
-                    }
-                } catch (...) {
-                    a = 0.0;
-                }
-                area_key[i] = a;
-            }
-            std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-                if (type_key[a] != type_key[b]) {
-                    return type_key[a] < type_key[b];
-                }
-                return area_key[a] > area_key[b];
-            });
-
-            std::vector<size_t> placed_indices;
-            size_t grid_idx = 0;
-
-            // 固定旋转：阵列模式一般不希望乱转，这里用当前rotation，不额外旋转
-            for (size_t ord_idx = 0; ord_idx < order.size() && grid_idx < grid_points.size(); ++ord_idx) {
-                if (requestQuit && *requestQuit) {
-                    break;
-                }
-
-                size_t i = order[ord_idx];
-                auto& shape = layout_.sheet_parts[0][i];
-                shape.update();
-
-                uint32_t original_rotation = shape.get_rotation();
-                size_t max_rot = std::min(static_cast<size_t>(shape.allowed_rotations),
-                                          static_cast<size_t>(params_.max_rotation_attempts));
-                if (max_rot == 0) {
-                    max_rot = 1;
-                }
-
-                for (; grid_idx < grid_points.size(); ++grid_idx) {
-                    auto tx = grid_points[grid_idx].x();
-                    auto ty = grid_points[grid_idx].y();
-
-                    auto old_x = shape.get_translate_ft_x();
-                    auto old_y = shape.get_translate_ft_y();
-
-                    bool placed_here = false;
-
-                    for (size_t r = 0; r < max_rot; ++r) {
-                        uint32_t rot = static_cast<uint32_t>(r);
-                        if (rot == original_rotation) {
-                            shape.set_rotation(original_rotation);
-                        } else {
-                            shape.set_rotation(rot);
-                        }
-
-                        shape.set_translate(tx, ty);
-                        shape.update();
-
-                        if (is_valid_placement(i, placed_indices)) {
-                            placed_here = true;
-                            break;
-                        }
-                    }
-
-                    if (placed_here) {
-                        placed_indices.push_back(i);
-                        ++grid_idx;
-                        break;
-                    }
-
-                    shape.set_translate(old_x, old_y);
-                    shape.set_rotation(original_rotation);
-                    shape.update();
-                }
-            }
-
-            // 未放置零件移到板外，方便查看
-            double outside_offset_final = -radius * 2.5;
-            std::set<size_t> placed_set(placed_indices.begin(), placed_indices.end());
-            for (size_t i = 0; i < layout_.poly_num; ++i) {
-                if (placed_set.find(i) == placed_set.end()) {
-                    auto& shape = layout_.sheet_parts[0][i];
-                    double offset_x = outside_offset_final + i * radius * 0.1;
-                    double offset_y = outside_offset_final;
-                    shape.set_translate(geo::FT(offset_x), geo::FT(offset_y));
-                    shape.update();
-                }
-            }
-
-            // 评估当前阵列：先看放了多少件，再看利用率
-            size_t placed_count = placed_indices.size();
-            double util = calculate_utilization();
-
-            if (placed_count > best_placed_count ||
-                (placed_count == best_placed_count && util > best_util)) {
-                best_placed_count = placed_count;
-                best_util = util;
-                best_parts = layout_.sheet_parts;
-            }
-        }
-    }
-
-    if (best_placed_count == 0 || best_parts.empty()) {
-        // 没有找到任何可行阵列
-        layout_.sheet_parts = original_parts;
-        best_utilization_ = 0.0;
+    bool placed_any = try_place_all_parts(diameter, requestQuit, progress_callback ? &progress_callback : nullptr);
+    if (!placed_any) {
         layout_.best_utilization = 0.0;
         layout_.best_result = layout_.sheet_parts;
         if (progress_callback) {
@@ -1951,11 +2222,87 @@ bool CircleNesting::optimize_array_mode(double target_utilization, volatile bool
         return false;
     }
 
-    // 使用搜索到的最佳阵列布局
-    layout_.sheet_parts = best_parts;
-    best_utilization_ = best_util;
-    layout_.best_utilization = best_utilization_;
-    layout_.best_result = layout_.sheet_parts;
+    if (!should_stop(requestQuit)) {
+        compact_layout(params_.compact_iterations, requestQuit, progress_callback ? &progress_callback : nullptr);
+        local_flip_micro_shift_repair(requestQuit, progress_callback ? &progress_callback : nullptr);
+    }
+
+    double util = 0.0;
+    try {
+        util = calculate_utilization();
+    } catch (...) {
+        util = 0.0;
+    }
+
+    if (util > best_utilization_) {
+        best_utilization_ = util;
+        layout_.best_utilization = best_utilization_;
+        layout_.best_result = layout_.sheet_parts;
+    } else {
+        layout_.best_utilization = std::max(prev_best_util, best_utilization_);
+        if (!prev_best_result.empty()) {
+            layout_.best_result = prev_best_result;
+            layout_.sheet_parts = layout_.best_result;
+        }
+    }
+
+    if (progress_callback) {
+        progress_callback(layout_);
+    }
+
+    return best_utilization_ >= target_utilization;
+}
+
+bool CircleNesting::optimize_diameter(double target_utilization, volatile bool* requestQuit,
+                                      std::function<void(const Layout&)> progress_callback) {
+    double theoretical_min = calculate_theoretical_min_diameter();
+    double current_diameter = safe_to_double(layout_.sheets[0].diameter);
+    if (current_diameter <= 0.0) {
+        return false;
+    }
+
+    const double prev_best_util = best_utilization_;
+    const auto prev_best_result = layout_.best_result;
+
+    double min_diameter = theoretical_min * params_.min_diameter_ratio;
+    if (min_diameter <= 0.0) {
+        min_diameter = theoretical_min;
+    }
+    if (min_diameter > current_diameter) {
+        min_diameter = current_diameter;
+    }
+
+    double best_diameter = current_diameter;
+    if (params_.use_binary_search) {
+        best_diameter = binary_search_diameter(min_diameter, current_diameter,
+                                               target_utilization, requestQuit, progress_callback);
+    }
+
+    update_circle_diameter(best_diameter);
+
+    if (!should_stop(requestQuit)) {
+        compact_layout(params_.compact_iterations, requestQuit, progress_callback ? &progress_callback : nullptr);
+        local_flip_micro_shift_repair(requestQuit, progress_callback ? &progress_callback : nullptr);
+    }
+
+    double util = 0.0;
+    try {
+        util = calculate_utilization();
+    } catch (...) {
+        util = 0.0;
+    }
+
+    if (util > best_utilization_) {
+        best_utilization_ = util;
+        layout_.best_utilization = best_utilization_;
+        layout_.best_result = layout_.sheet_parts;
+    } else {
+        layout_.best_utilization = std::max(prev_best_util, best_utilization_);
+        if (!prev_best_result.empty()) {
+            layout_.best_result = prev_best_result;
+            layout_.sheet_parts = layout_.best_result;
+        }
+    }
 
     if (progress_callback) {
         progress_callback(layout_);
@@ -1967,6 +2314,10 @@ bool CircleNesting::optimize_array_mode(double target_utilization, volatile bool
 bool CircleNesting::optimize(double target_utilization, volatile bool* requestQuit,
                              std::function<void(const Layout&)> progress_callback) {
     best_utilization_ = 0.0;
+    have_validated_best_ = false;
+    last_validated_best_utilization_ = 0.0;
+    last_validated_best_result_.clear();
+    next_cgal_validation_time_ = std::chrono::steady_clock::time_point{};
     
     try {
         // 阵列模式：直接走阵列排样逻辑（不做直径搜索）
@@ -2003,12 +2354,15 @@ bool CircleNesting::optimize(double target_utilization, volatile bool* requestQu
             // 即使只放置了部分零件，也继续后续优化（紧凑化、直径优化等）
         }
 
+        maybe_cgal_validate_and_checkpoint_best(requestQuit);
+
         // 如果用户已经请求退出，跳过后续紧凑化和直径优化，直接用当前结果
         if (should_stop(requestQuit)) {
             double util_now = calculate_utilization();
             best_utilization_ = util_now;
             layout_.best_utilization = best_utilization_;
             layout_.best_result = layout_.sheet_parts;
+            maybe_cgal_validate_and_checkpoint_best(requestQuit);
             if (progress_callback) {
                 progress_callback(layout_);
             }
@@ -2036,6 +2390,8 @@ bool CircleNesting::optimize(double target_utilization, volatile bool* requestQu
 
         // 紧凑化
         compact_layout(params_.compact_iterations, requestQuit, &progress_callback);
+
+        local_flip_micro_shift_repair(requestQuit, &progress_callback);
         
         // 确保 best_result 是最新的最佳状态（即使被停止）
         double current_util = calculate_utilization();
@@ -2043,6 +2399,7 @@ bool CircleNesting::optimize(double target_utilization, volatile bool* requestQu
             best_utilization_ = current_util;
             layout_.best_utilization = best_utilization_;
             layout_.best_result = layout_.sheet_parts;
+            maybe_cgal_validate_and_checkpoint_best(requestQuit);
         }
         
         // 再次检查上界/下界差距
@@ -2063,6 +2420,14 @@ bool CircleNesting::optimize(double target_utilization, volatile bool* requestQu
 
         // 如果已达到目标，直接返回
         if (best_utilization_ >= target_utilization) {
+            maybe_cgal_validate_and_checkpoint_best(requestQuit);
+            if (params_.geometry_library == Parameters::GeometryLibrary::Clipper &&
+                !layout_.best_result.empty() && !layout_.best_result[0].empty()) {
+                bool final_ok = cgal_validate_no_overlap_for_parts(layout_.best_result[0], requestQuit);
+                if (!final_ok) {
+                    rollback_to_last_validated_best();
+                }
+            }
             return true;
         }
 
@@ -2076,9 +2441,20 @@ bool CircleNesting::optimize(double target_utilization, volatile bool* requestQu
                 best_utilization_ = final_util;
                 layout_.best_utilization = best_utilization_;
                 layout_.best_result = layout_.sheet_parts;
+                maybe_cgal_validate_and_checkpoint_best(requestQuit);
             }
         }
-        
+
+        maybe_cgal_validate_and_checkpoint_best(requestQuit);
+        if (params_.geometry_library == Parameters::GeometryLibrary::Clipper &&
+            !layout_.best_result.empty() && !layout_.best_result[0].empty()) {
+            bool final_ok = cgal_validate_no_overlap_for_parts(layout_.best_result[0], requestQuit);
+            if (!final_ok) {
+                rollback_to_last_validated_best();
+                diameter_success = best_utilization_ >= target_utilization;
+            }
+        }
+
         return diameter_success;
     }
     catch (...) {
@@ -2321,6 +2697,10 @@ double CircleNesting::binary_search_diameter(double min_diameter, double max_dia
         if (placed_count > 0) {
             // 紧凑化
             compact_layout(params_.compact_iterations / 2, requestQuit, &progress_callback);
+
+            qWarning() << "[LOCAL_REPAIR] call: test_diameter=" << test_diameter;
+            local_flip_micro_shift_repair(requestQuit, &progress_callback);
+            qWarning() << "[LOCAL_REPAIR] return: test_diameter=" << test_diameter;
             
             double util = calculate_utilization();
             

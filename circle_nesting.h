@@ -105,6 +105,12 @@ namespace nesting {
         double best_utilization_;
         double current_diameter_;
 
+        bool have_validated_best_{ false };
+        double last_validated_best_utilization_{ 0.0 };
+        std::vector<std::vector<TransformedShape>> last_validated_best_result_;
+
+        std::chrono::steady_clock::time_point next_cgal_validation_time_;
+
         bool use_time_limit_{ false };
         std::chrono::steady_clock::time_point deadline_;
 
@@ -115,6 +121,14 @@ namespace nesting {
         double quality_gate_{ 0.0 };
 
         bool should_stop(volatile bool* requestQuit) const;
+
+        bool cgal_validate_no_overlap_for_parts(const std::vector<TransformedShape>& parts,
+                                                volatile bool* requestQuit) const;
+        void maybe_cgal_validate_and_checkpoint_best(volatile bool* requestQuit);
+        void rollback_to_last_validated_best();
+
+        void local_flip_micro_shift_repair(volatile bool* requestQuit,
+                                           std::function<void(const Layout&)>* progress_callback);
 
         // 计算理论最小直径（基于总面积）
         double calculate_theoretical_min_diameter() const;
