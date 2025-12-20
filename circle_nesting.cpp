@@ -968,18 +968,35 @@ std::vector<geo::Point_2> CircleNesting::generate_circular_candidates(
             auto perfect_points = c.get_perfect_points();
             
             // 过滤：只保留在圆内的点
+            std::vector<geo::Point_2> perfect_in_circle;
+            perfect_in_circle.reserve(perfect_points.size());
             for (const auto& pt : perfect_points) {
                 double dx = safe_to_double(pt.x()) - center_x;
                 double dy = safe_to_double(pt.y()) - center_y;
                 double dist_sq = dx * dx + dy * dy;
                 if (dist_sq <= radius * radius) {
-                    candidates.push_back(pt);
+                    perfect_in_circle.push_back(pt);
                 }
             }
+
+            const size_t max_keep = std::max<size_t>(1, params_.max_candidate_points / 2);
+            if (perfect_in_circle.size() > max_keep) {
+                std::sort(perfect_in_circle.begin(), perfect_in_circle.end(), [&](const geo::Point_2& a, const geo::Point_2& b) {
+                    double dax = safe_to_double(a.x()) - center_x;
+                    double day = safe_to_double(a.y()) - center_y;
+                    double dbx = safe_to_double(b.x()) - center_x;
+                    double dby = safe_to_double(b.y()) - center_y;
+                    return (dax * dax + day * day) < (dbx * dbx + dby * dby);
+                });
+                perfect_in_circle.resize(max_keep);
+            }
+
+            candidates.insert(candidates.end(), perfect_in_circle.begin(), perfect_in_circle.end());
         }
 
         // 方法2：径向候选点生成（如果启用）- 增强版
-        if (params_.use_radial_candidates && candidates.size() < params_.max_candidate_points) {
+        const size_t reserve_for_ifr = std::min<size_t>(params_.max_candidate_points, std::max<size_t>(8, params_.max_candidate_points / 5));
+        if (params_.use_radial_candidates && candidates.size() + reserve_for_ifr < params_.max_candidate_points) {
             auto bbox = shape.transformed.bbox();
             double shape_width = safe_to_double(bbox.xmax() - bbox.xmin());
             double shape_height = safe_to_double(bbox.ymax() - bbox.ymin());
@@ -1015,15 +1032,15 @@ std::vector<geo::Point_2> CircleNesting::generate_circular_candidates(
                             candidates.push_back(geo::Point_2(geo::FT(x), geo::FT(y)));
                         }
                         
-                        if (candidates.size() >= params_.max_candidate_points) {
+                        if (candidates.size() + reserve_for_ifr >= params_.max_candidate_points) {
                             break;
                         }
                     }
-                    if (candidates.size() >= params_.max_candidate_points) {
+                    if (candidates.size() + reserve_for_ifr >= params_.max_candidate_points) {
                         break;
                     }
                 }
-                if (candidates.size() >= params_.max_candidate_points) {
+                if (candidates.size() + reserve_for_ifr >= params_.max_candidate_points) {
                     break;
                 }
             }
@@ -1040,6 +1057,60 @@ std::vector<geo::Point_2> CircleNesting::generate_circular_candidates(
                 }
                 if (candidates.size() >= params_.max_candidate_points) {
                     break;
+                }
+            }
+        }
+
+        if (candidates.size() < params_.max_candidate_points && !ifr.is_empty()) {
+            auto add_if_ok = [&](const geo::Point_2& p) {
+                double dx = safe_to_double(p.x()) - center_x;
+                double dy = safe_to_double(p.y()) - center_y;
+                double dist_sq = dx * dx + dy * dy;
+                if (dist_sq <= radius * radius) {
+                    candidates.push_back(p);
+                }
+            };
+
+            auto interp = [&](const geo::Point_2& a, const geo::Point_2& b, double t) -> geo::Point_2 {
+                const geo::FT tt(t);
+                const geo::FT one(1.0);
+                const geo::FT omt = one - tt;
+                return geo::Point_2{ a.x() * omt + b.x() * tt, a.y() * omt + b.y() * tt };
+            };
+
+            auto vb = ifr.vertices_begin();
+            if (vb != ifr.vertices_end()) {
+                auto prev = vb;
+                auto cur = vb;
+                ++cur;
+                for (; cur != ifr.vertices_end(); ++cur) {
+                    if (candidates.size() >= params_.max_candidate_points) {
+                        break;
+                    }
+                    geo::Point_2 a = *prev;
+                    geo::Point_2 b = *cur;
+                    add_if_ok(interp(a, b, 0.5));
+                    if (candidates.size() >= params_.max_candidate_points) {
+                        break;
+                    }
+                    add_if_ok(interp(a, b, 0.25));
+                    if (candidates.size() >= params_.max_candidate_points) {
+                        break;
+                    }
+                    add_if_ok(interp(a, b, 0.75));
+                    prev = cur;
+                }
+
+                if (candidates.size() < params_.max_candidate_points) {
+                    geo::Point_2 a = *prev;
+                    geo::Point_2 b = *vb;
+                    add_if_ok(interp(a, b, 0.5));
+                    if (candidates.size() < params_.max_candidate_points) {
+                        add_if_ok(interp(a, b, 0.25));
+                    }
+                    if (candidates.size() < params_.max_candidate_points) {
+                        add_if_ok(interp(a, b, 0.75));
+                    }
                 }
             }
         }
@@ -1397,6 +1468,8 @@ bool CircleNesting::try_place_all_parts(double diameter, volatile bool* requestQ
     }
 
     std::vector<size_t> placed_indices;
+    size_t lns_total_trials = 0;
+    const size_t lns_max_trials = 30;
     
     // 放置第一个零件：稍微远离中心，给其他零件留出空间
     if (!indices.empty()) {
@@ -1451,6 +1524,145 @@ bool CircleNesting::try_place_all_parts(double diameter, volatile bool* requestQ
         if (placed) {
             // 成功放置，添加到已放置列表
             placed_indices.push_back(shape_idx);
+        } else if (!should_stop(requestQuit) && lns_total_trials < lns_max_trials && placed_indices.size() >= 10) {
+            auto placed_before = placed_indices;
+            auto& target_shape = layout_.sheet_parts[0][shape_idx];
+            const auto old_target_rot = target_shape.get_rotation();
+            const auto old_target_x = target_shape.get_translate_ft_x();
+            const auto old_target_y = target_shape.get_translate_ft_y();
+
+            target_shape.update();
+            auto tbbox = target_shape.transformed.bbox();
+            double t_w = safe_to_double(tbbox.xmax() - tbbox.xmin());
+            double t_h = safe_to_double(tbbox.ymax() - tbbox.ymin());
+            double anchor_x = radius - t_w / 2.0;
+            double anchor_y = radius - t_h / 2.0;
+
+            auto shape_area = [&](size_t idx) -> double {
+                try {
+                    return safe_to_double(geo::pwh_area(*layout_.sheet_parts[0][idx].base));
+                } catch (...) {
+                    return 0.0;
+                }
+            };
+            auto shape_center = [&](size_t idx) -> std::pair<double, double> {
+                try {
+                    auto& s = layout_.sheet_parts[0][idx];
+                    s.update();
+                    auto bb = s.transformed.bbox();
+                    double cx = 0.5 * (safe_to_double(bb.xmin()) + safe_to_double(bb.xmax()));
+                    double cy = 0.5 * (safe_to_double(bb.ymin()) + safe_to_double(bb.ymax()));
+                    return { cx, cy };
+                } catch (...) {
+                    return { 0.0, 0.0 };
+                }
+            };
+
+            std::vector<size_t> near;
+            near.reserve(placed_indices.size());
+            for (size_t pidx : placed_indices) {
+                near.push_back(pidx);
+            }
+            std::sort(near.begin(), near.end(), [&](size_t a, size_t b) {
+                auto ca = shape_center(a);
+                auto cb = shape_center(b);
+                double dax = ca.first - anchor_x;
+                double day = ca.second - anchor_y;
+                double dbx = cb.first - anchor_x;
+                double dby = cb.second - anchor_y;
+                return (dax * dax + day * day) < (dbx * dbx + dby * dby);
+            });
+            if (near.size() > 12) {
+                near.resize(12);
+            }
+            std::sort(near.begin(), near.end(), [&](size_t a, size_t b) {
+                double aa = shape_area(a);
+                double ab = shape_area(b);
+                if (aa != ab) {
+                    return aa < ab;
+                }
+                auto ca = shape_center(a);
+                auto cb = shape_center(b);
+                double dax = ca.first - anchor_x;
+                double day = ca.second - anchor_y;
+                double dbx = cb.first - anchor_x;
+                double dby = cb.second - anchor_y;
+                return (dax * dax + day * day) < (dbx * dbx + dby * dby);
+            });
+
+            bool lns_success = false;
+            for (size_t k = 1; k <= 2 && !lns_success; ++k) {
+                if (should_stop(requestQuit) || lns_total_trials >= lns_max_trials) {
+                    break;
+                }
+                if (near.size() < k) {
+                    break;
+                }
+                ++lns_total_trials;
+
+                std::vector<size_t> removed;
+                removed.reserve(k);
+                for (size_t ri = 0; ri < k; ++ri) {
+                    removed.push_back(near[ri]);
+                }
+
+                struct SavedState {
+                    uint32_t rot;
+                    geo::FT x;
+                    geo::FT y;
+                };
+                std::vector<std::pair<size_t, SavedState>> removed_state;
+                removed_state.reserve(removed.size());
+                for (size_t ridx : removed) {
+                    auto& s = layout_.sheet_parts[0][ridx];
+                    removed_state.push_back({ ridx, SavedState{ s.get_rotation(), s.get_translate_ft_x(), s.get_translate_ft_y() } });
+                }
+
+                auto remove_from_vec = [&](std::vector<size_t>& vec, size_t val) {
+                    vec.erase(std::remove(vec.begin(), vec.end(), val), vec.end());
+                };
+
+                for (size_t ridx : removed) {
+                    remove_from_vec(placed_indices, ridx);
+                    auto& s = layout_.sheet_parts[0][ridx];
+                    s.set_translate(geo::FT(outside_offset), geo::FT(outside_offset));
+                    s.update();
+                }
+
+                bool placed_target = place_shape_with_nfp(shape_idx, placed_indices, /*try_all_rotations=*/true, requestQuit);
+                if (placed_target) {
+                    placed_indices.push_back(shape_idx);
+                    bool reinsert_ok = true;
+                    for (size_t ridx : removed) {
+                        if (should_stop(requestQuit)) {
+                            reinsert_ok = false;
+                            break;
+                        }
+                        bool placed_back = place_shape_with_nfp(ridx, placed_indices, /*try_all_rotations=*/true, requestQuit);
+                        if (!placed_back) {
+                            reinsert_ok = false;
+                            break;
+                        }
+                        placed_indices.push_back(ridx);
+                    }
+                    if (reinsert_ok) {
+                        lns_success = true;
+                    }
+                }
+
+                if (!lns_success) {
+                    placed_indices = placed_before;
+                    target_shape.set_rotation(old_target_rot);
+                    target_shape.set_translate(old_target_x, old_target_y);
+                    target_shape.update();
+                    for (const auto& kv : removed_state) {
+                        auto& s = layout_.sheet_parts[0][kv.first];
+                        s.set_rotation(kv.second.rot);
+                        s.set_translate(kv.second.x, kv.second.y);
+                        s.update();
+                    }
+                }
+            }
         }
         // 如果无法放置，继续尝试下一个零件（不直接返回false）
         // 这样可以让算法尝试放置尽可能多的零件，即使不是所有零件都能放置
@@ -1481,6 +1693,32 @@ bool CircleNesting::try_place_all_parts(double diameter, volatile bool* requestQ
                     layout_.best_result = layout_.sheet_parts;
                 }
                 (*progress_callback)(layout_);
+            }
+        }
+    }
+
+    if (!placed_indices.empty() && !should_stop(requestQuit)) {
+        std::set<size_t> placed_set_tmp(placed_indices.begin(), placed_indices.end());
+        for (size_t i = 0; i < indices.size(); ++i) {
+            if (should_stop(requestQuit)) {
+                break;
+            }
+            size_t shape_idx = indices[i];
+            if (placed_set_tmp.find(shape_idx) != placed_set_tmp.end()) {
+                continue;
+            }
+            if (can_never_fit_in_circle(shape_idx)) {
+                continue;
+            }
+            bool placed = place_shape_with_nfp(shape_idx, placed_indices, /*try_all_rotations=*/true, requestQuit);
+            if (placed) {
+                placed_indices.push_back(shape_idx);
+                placed_set_tmp.insert(shape_idx);
+                if (progress_callback && (placed_indices.size() % 5 == 0)) {
+                    layout_.best_result = layout_.sheet_parts;
+                    layout_.best_utilization = best_utilization_;
+                    (*progress_callback)(layout_);
+                }
             }
         }
     }
