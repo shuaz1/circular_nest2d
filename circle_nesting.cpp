@@ -1299,9 +1299,18 @@ bool CircleNesting::place_shape_with_nfp(size_t shape_idx,
                     if (allowed_for_bias >= 2 && neighbor_threshold > 0.0 &&
                         nearest_same_dist < neighbor_threshold) {
                         uint32_t desired = (nearest_same_rotation + allowed_for_bias / 2) % allowed_for_bias;
-                        const double bias = 2e-3 * (radius * radius + 1.0);
+                        double w = (neighbor_threshold - nearest_same_dist) / neighbor_threshold;
+                        if (w < 0.0) w = 0.0;
+                        if (w > 1.0) w = 1.0;
+
+                        const double scale = (radius * radius + 1.0);
+                        const double penalty = scale * 0.12 * w;
+                        const double reward = scale * 0.06 * w;
+
                         if ((rot % allowed_for_bias) != desired) {
-                            score += bias;
+                            score += penalty;
+                        } else {
+                            score -= reward;
                         }
                     }
                     
@@ -2234,13 +2243,17 @@ bool CircleNesting::optimize_array_mode(double target_utilization, volatile bool
         util = 0.0;
     }
 
+    const double util_eps = 1e-9;
+
     if (util > best_utilization_) {
         best_utilization_ = util;
         layout_.best_utilization = best_utilization_;
         layout_.best_result = layout_.sheet_parts;
     } else {
         layout_.best_utilization = std::max(prev_best_util, best_utilization_);
-        if (!prev_best_result.empty()) {
+        if (util + util_eps >= layout_.best_utilization) {
+            layout_.best_result = layout_.sheet_parts;
+        } else if (!prev_best_result.empty()) {
             layout_.best_result = prev_best_result;
             layout_.sheet_parts = layout_.best_result;
         }
@@ -2400,6 +2413,11 @@ bool CircleNesting::optimize(double target_utilization, volatile bool* requestQu
             layout_.best_utilization = best_utilization_;
             layout_.best_result = layout_.sheet_parts;
             maybe_cgal_validate_and_checkpoint_best(requestQuit);
+        } else {
+            const double util_eps = 1e-9;
+            if (current_util + util_eps >= layout_.best_utilization) {
+                layout_.best_result = layout_.sheet_parts;
+            }
         }
         
         // 再次检查上界/下界差距
@@ -2664,7 +2682,9 @@ double CircleNesting::binary_search_diameter(double min_diameter, double max_dia
                                              double target_utilization, volatile bool* requestQuit,
                                              std::function<void(const Layout&)> progress_callback) {
     double best_diameter = max_diameter;
+    size_t best_placed_count = 0;
     double best_utilization = 0.0;
+    const double util_eps = 1e-9;
     const double tolerance = 0.001; // 直径容差
     const size_t max_iterations = 50;
     
@@ -2693,39 +2713,47 @@ double CircleNesting::binary_search_diameter(double min_diameter, double max_dia
                 placed_count++;
             }
         }
-        
+
+        double util = 0.0;
         if (placed_count > 0) {
-            // 紧凑化
+            // 紧凑化 + 局部修复（即使没放全，也要尽量提升“放入数量/形态”）
             compact_layout(params_.compact_iterations / 2, requestQuit, &progress_callback);
 
             qWarning() << "[LOCAL_REPAIR] call: test_diameter=" << test_diameter;
             local_flip_micro_shift_repair(requestQuit, &progress_callback);
             qWarning() << "[LOCAL_REPAIR] return: test_diameter=" << test_diameter;
-            
-            double util = calculate_utilization();
-            
-            if (util > best_utilization) {
-                best_utilization = util;
-                best_diameter = test_diameter;
-                
-                layout_.best_result = layout_.sheet_parts;
-                layout_.best_utilization = util;
-                
-                if (progress_callback) {
-                    progress_callback(layout_);
-                }
+
+            try {
+                util = calculate_utilization();
+            } catch (...) {
+                util = 0.0;
             }
-            
-            if (util >= target_utilization) {
-                // 可以尝试更小的直径
-                max_diameter = test_diameter;
-            } else {
-                // 需要更大的直径
-                min_diameter = test_diameter;
+        }
+
+        // 记录最优：放入数量优先，其次利用率，其次更小直径
+        if (placed_count > best_placed_count ||
+            (placed_count == best_placed_count && (util > best_utilization + util_eps)) ||
+            (placed_count == best_placed_count && std::abs(util - best_utilization) <= util_eps &&
+             test_diameter + tolerance < best_diameter)) {
+            best_placed_count = placed_count;
+            best_utilization = util;
+            best_diameter = test_diameter;
+
+            layout_.best_result = layout_.sheet_parts;
+            layout_.best_utilization = util;
+
+            if (progress_callback) {
+                progress_callback(layout_);
             }
-        } else {
-            // 无法放置，需要更大的直径
+        }
+
+        // 二分方向：
+        // - 放不全：必须增大直径，才可能放入更多
+        // - 放全：尝试缩小直径以提高紧凑度/利用率
+        if (placed_count < layout_.poly_num) {
             min_diameter = test_diameter;
+        } else {
+            max_diameter = test_diameter;
         }
     }
     
