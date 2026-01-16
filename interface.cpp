@@ -28,9 +28,12 @@ namespace nesting {
         clock_t start_clock = clock();
         
         CircleNesting circle_nesting(layout);
-        circle_nesting.set_time_limit_seconds(0);
-        circle_nesting.set_quality_gate(0.0);
-        circle_nesting.set_hard_time_limit_seconds(max_time);
+        // 软截止：到点后若已达标才允许停止（未达标则继续）
+        circle_nesting.set_time_limit_seconds(max_time);
+        // 硬保底：未达到 0.85 前忽略 soft time limit
+        circle_nesting.set_quality_gate(0.85);
+        // 防止无限运行：默认硬上限 30 分钟（可后续做成 GUI 参数）
+        circle_nesting.set_hard_time_limit_seconds(30 * 60);
 
         // 设置参数
         CircleNesting::Parameters params;
@@ -105,15 +108,6 @@ namespace nesting {
             params.use_random_shuffle = true;
         }
 
-        // 单轮模式：不做“第二轮”类的重启搜索（多顺序/直径二分）。
-        // 仅执行一次固定直径的放置 +（可选）紧凑化/局部修复，然后退出。
-        params.use_scheduling = false;
-        params.scheduling_attempts = 0;
-        params.use_random_shuffle = false;
-        params.use_binary_search = false;
-        params.diameter_optimization_iterations = 0;
-        params.stop_after_first_stage = true;
-
         // 阵列模式相关参数由 GUI 侧控制，这里保持默认：use_array_mode=false。
         circle_nesting.set_parameters(params);
         
@@ -160,7 +154,8 @@ namespace nesting {
         
         // 执行优化
         // 目标利用率按用户要求：0.85（并受 max_time 时间预算约束）
-        bool success = circle_nesting.optimize(0.0, requestQuit, progress_wrapper);
+        double target_util = 0.85;
+        bool success = circle_nesting.optimize(target_util, requestQuit, progress_wrapper);
         
         // 无论成功与否，都确保报告最佳结果（避免停止时显示下降）
         // 如果 best_result 存在，说明有找到更好的解

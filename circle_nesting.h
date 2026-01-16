@@ -77,8 +77,6 @@ namespace nesting {
             bool use_improved_lower_bound = true;  // 是否使用改进的下界计算（考虑形状约束）
             bool use_hodograph_initial = false;    // 是否使用Hodograph方法生成快速初始解
 
-            bool stop_after_first_stage = false;
-
             // 几何库选择参数
             enum class GeometryLibrary {
                 CGAL,      // 使用 CGAL（精确但较慢）

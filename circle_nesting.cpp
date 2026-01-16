@@ -13,7 +13,6 @@
 #include <numeric>
 #include <random>
 #include <set>
-#include <unordered_map>
 #include <QtDebug>
 
 namespace nesting {
@@ -1181,7 +1180,8 @@ bool CircleNesting::place_shape_with_nfp(size_t shape_idx,
             const size_t max_candidates_per_shape = params_.max_candidate_points;
 
             for (size_t layer = 0; layer < radial_layers; ++layer) {
-                if (should_stop(requestQuit)) {
+                if (requestQuit && *requestQuit) {
+                    // 用户请求停止，立即返回
                     return false;
                 }
                 double layer_ratio = double(layer) / (radial_layers - 1);
@@ -1285,7 +1285,8 @@ bool CircleNesting::place_shape_with_nfp(size_t shape_idx,
         size_t total_attempts = 0;
 
         for (uint32_t rot : rotations_to_try) {
-            if (should_stop(requestQuit)) {
+            if (requestQuit && *requestQuit) {
+                // 用户请求停止，立即返回
                 return false;
             }
             shape.set_rotation(rot);
@@ -1315,7 +1316,8 @@ bool CircleNesting::place_shape_with_nfp(size_t shape_idx,
             }
 
             for (const auto& candidate : candidates_for_rotation) {
-                if (should_stop(requestQuit)) {
+                if (requestQuit && *requestQuit) {
+                    // 用户请求停止，立即返回
                     return false;
                 }
                 if (total_attempts >= max_total_attempts_per_shape) {
@@ -1501,7 +1503,7 @@ bool CircleNesting::try_place_all_parts(double diameter, volatile bool* requestQ
 
     // 依次放置剩余零件
     for (size_t i = 1; i < indices.size(); ++i) {
-        if (should_stop(requestQuit)) {
+        if (requestQuit && *requestQuit) {
             return false;
         }
 
@@ -2645,14 +2647,6 @@ bool CircleNesting::optimize(double target_utilization, volatile bool* requestQu
                 if (progress_callback) {
                     progress_callback(layout_);
                 }
-                if (params_.stop_after_first_stage) {
-                    maybe_cgal_validate_and_checkpoint_best(requestQuit);
-                    return true;
-                }
-                if (best_utilization_ >= target_utilization) {
-                    maybe_cgal_validate_and_checkpoint_best(requestQuit);
-                    return true;
-                }
             }
         }
 
@@ -2665,31 +2659,6 @@ bool CircleNesting::optimize(double target_utilization, volatile bool* requestQu
                 return false;
             }
             // 即使只放置了部分零件，也继续后续优化（紧凑化、直径优化等）
-            double util_now = 0.0;
-            try {
-                util_now = calculate_utilization();
-            } catch (...) {
-                util_now = 0.0;
-            }
-            if (util_now > best_utilization_) {
-                best_utilization_ = util_now;
-                layout_.best_utilization = best_utilization_;
-                layout_.best_result = layout_.sheet_parts;
-            }
-            if (params_.stop_after_first_stage) {
-                maybe_cgal_validate_and_checkpoint_best(requestQuit);
-                if (progress_callback) {
-                    progress_callback(layout_);
-                }
-                return true;
-            }
-            if (best_utilization_ >= target_utilization) {
-                maybe_cgal_validate_and_checkpoint_best(requestQuit);
-                if (progress_callback) {
-                    progress_callback(layout_);
-                }
-                return true;
-            }
         }
 
         maybe_cgal_validate_and_checkpoint_best(requestQuit);
@@ -2882,13 +2851,6 @@ std::vector<size_t> CircleNesting::schedule_best_order(double diameter, volatile
     std::random_device rd;
     std::mt19937 gen(rd());
 
-    auto better = [&](size_t placed_a, double util_a, size_t placed_b, double util_b) {
-        if (placed_a != placed_b) {
-            return placed_a > placed_b;
-        }
-        return util_a > util_b;
-    };
-
     std::vector<size_t> best_order = smart_order_parts();
     size_t best_placed_count = 0;
     double best_util = 0.0;
@@ -2912,116 +2874,67 @@ std::vector<size_t> CircleNesting::schedule_best_order(double diameter, volatile
     // 内存优化：复用空列表
     const std::vector<size_t> empty_placed;
 
-    auto shape_area = [&](size_t idx) -> double {
-        try {
-            return safe_to_double(geo::pwh_area(*original_parts[0][idx].base));
-        } catch (...) {
-            return 0.0;
-        }
-    };
+    for (size_t attempt = 0; attempt < params_.scheduling_attempts; ++attempt) {
+        if (requestQuit && *requestQuit) break;
 
-    struct GroupInfo {
-        size_t key;
-        std::vector<size_t> indices;
-        double area_sum;
-    };
-
-    std::vector<GroupInfo> groups;
-    groups.reserve(layout_.poly_num);
-    {
-        std::unordered_map<size_t, size_t> group_pos;
-        group_pos.reserve(layout_.poly_num);
-        for (size_t i = 0; i < layout_.poly_num; ++i) {
-            size_t key = static_cast<size_t>(original_parts[0][i].item_idx);
-            auto it = group_pos.find(key);
-            if (it == group_pos.end()) {
-                GroupInfo g;
-                g.key = key;
-                g.indices.clear();
-                g.indices.push_back(i);
-                g.area_sum = shape_area(i);
-                groups.push_back(std::move(g));
-                group_pos[key] = groups.size() - 1;
-            } else {
-                auto& g = groups[it->second];
-                g.indices.push_back(i);
-                g.area_sum += shape_area(i);
-            }
-        }
-    }
-
-    std::vector<GroupInfo> groups_by_area = groups;
-    std::sort(groups_by_area.begin(), groups_by_area.end(), [&](const GroupInfo& a, const GroupInfo& b) {
-        if (a.area_sum != b.area_sum) {
-            return a.area_sum > b.area_sum;
-        }
-        return a.indices.size() > b.indices.size();
-    });
-
-    auto build_group_order = [&](bool shuffle_groups, bool shuffle_within, bool sort_within_by_area) {
-        std::vector<GroupInfo> gs = groups_by_area;
-        if (shuffle_groups) {
-            std::shuffle(gs.begin(), gs.end(), gen);
-        }
+        // 生成候选顺序（复用 candidate_order）
         candidate_order.clear();
-        candidate_order.reserve(layout_.poly_num);
-        for (auto& g : gs) {
-            if (sort_within_by_area) {
-                std::sort(g.indices.begin(), g.indices.end(), [&](size_t i, size_t j) {
-                    return shape_area(i) > shape_area(j);
-                });
-            }
-            if (shuffle_within) {
-                std::shuffle(g.indices.begin(), g.indices.end(), gen);
-            }
-            candidate_order.insert(candidate_order.end(), g.indices.begin(), g.indices.end());
+        if (attempt == 0) {
+            candidate_order = smart_order_parts();
+        } else if (attempt == 1) {
+            candidate_order.resize(layout_.poly_num);
+            std::iota(candidate_order.begin(), candidate_order.end(), 0);
+            std::sort(candidate_order.begin(), candidate_order.end(), [&](size_t i, size_t j) {
+                try {
+                    double area_i = safe_to_double(geo::pwh_area(*original_parts[0][i].base));
+                    double area_j = safe_to_double(geo::pwh_area(*original_parts[0][j].base));
+                    return area_i > area_j;
+                } catch (...) {
+                    return false;
+                }
+            });
+        } else if (params_.use_random_shuffle) {
+            candidate_order = smart_order_parts();
+            std::shuffle(candidate_order.begin(), candidate_order.end(), gen);
+        } else {
+            continue;
         }
-    };
 
-    auto eval_order = [&](const std::vector<size_t>& order, std::vector<std::vector<TransformedShape>>* out_layout,
-                          size_t& out_placed, double& out_util) {
+        // 恢复初始状态
         layout_.sheet_parts = original_parts;
         update_circle_diameter(diameter);
 
+        // 复用 placed_indices
         placed_indices.clear();
         double radius = diameter / 2.0;
-        double outside_offset = -radius * 2.0;
-        for (auto& s : layout_.sheet_parts[0]) {
-            s.set_translate(geo::FT(outside_offset), geo::FT(outside_offset));
-            s.update();
-        }
 
-        if (!order.empty()) {
-            size_t first_idx = order[0];
-            if (!can_never_fit_in_circle(first_idx)) {
-                auto& shape = layout_.sheet_parts[0][first_idx];
-                shape.update();
-                auto bbox = shape.transformed.bbox();
-                double shape_width = safe_to_double(bbox.xmax() - bbox.xmin());
-                double shape_height = safe_to_double(bbox.ymax() - bbox.ymin());
-                shape.set_translate(geo::FT(radius - shape_width / 2.0),
-                                    geo::FT(radius - shape_height / 2.0));
-                shape.update();
+        // 放置第一个零件
+        if (!candidate_order.empty()) {
+            size_t first_idx = candidate_order[0];
+            auto& shape = layout_.sheet_parts[0][first_idx];
+            shape.update();
+            auto bbox = shape.transformed.bbox();
+            double shape_width = safe_to_double(bbox.xmax() - bbox.xmin());
+            double shape_height = safe_to_double(bbox.ymax() - bbox.ymin());
+            shape.set_translate(geo::FT(radius - shape_width / 2.0),
+                                geo::FT(radius - shape_height / 2.0));
+            shape.update();
 
-                if (is_valid_placement(first_idx, empty_placed)) {
-                    placed_indices.push_back(first_idx);
-                } else if (place_shape_with_nfp(first_idx, empty_placed, params_.try_all_rotations, requestQuit)) {
-                    placed_indices.push_back(first_idx);
-                }
+            if (is_valid_placement(first_idx, empty_placed)) {
+                placed_indices.push_back(first_idx);
+            } else if (place_shape_with_nfp(first_idx, empty_placed, params_.try_all_rotations, requestQuit)) {
+                placed_indices.push_back(first_idx);
             }
         }
 
-        for (size_t i = 1; i < order.size(); ++i) {
-            if (should_stop(requestQuit)) {
-                break;
-            }
-            size_t shape_idx = order[i];
-            if (can_never_fit_in_circle(shape_idx)) {
-                continue;
-            }
+        // 放置剩余零件
+        for (size_t i = 1; i < candidate_order.size(); ++i) {
+            if (requestQuit && *requestQuit) break;
+            size_t shape_idx = candidate_order[i];
             bool placed = place_shape_with_nfp(shape_idx, placed_indices, params_.try_all_rotations, requestQuit);
             if (placed) {
                 placed_indices.push_back(shape_idx);
+
                 if (progress_callback && (placed_indices.size() % 5 == 0)) {
                     layout_.best_result = layout_.sheet_parts;
                     layout_.best_utilization = best_utilization_;
@@ -3030,107 +2943,22 @@ std::vector<size_t> CircleNesting::schedule_best_order(double diameter, volatile
             }
         }
 
-        out_placed = placed_indices.size();
-        out_util = 0.0;
-        try {
-            out_util = calculate_utilization();
-        } catch (...) {
-            out_util = 0.0;
-        }
-
-        if (out_layout) {
-            *out_layout = layout_.sheet_parts;
-        }
-    };
-
-    auto ils_improve = [&](std::vector<size_t>& order, size_t& best_placed, double& best_u,
-                           std::vector<std::vector<TransformedShape>>& best_l) {
-        if (order.size() < 6) {
-            return;
-        }
-        std::uniform_int_distribution<int> move_type(0, 1);
-        const size_t max_iters = std::min<size_t>(20, std::max<size_t>(5, layout_.poly_num / 50));
-        for (size_t it = 0; it < max_iters; ++it) {
-            if (should_stop(requestQuit)) {
-                break;
-            }
-
-            std::vector<size_t> cand = order;
-            size_t n0 = cand.size();
-            std::uniform_int_distribution<size_t> pick(0, n0 - 1);
-            size_t a = pick(gen);
-            size_t b = pick(gen);
-            if (a == b) {
-                continue;
-            }
-            if (move_type(gen) == 0) {
-                std::swap(cand[a], cand[b]);
-            } else {
-                size_t from = a;
-                size_t to = b;
-                size_t v = cand[from];
-                cand.erase(cand.begin() + static_cast<std::ptrdiff_t>(from));
-                if (to > from) {
-                    --to;
-                }
-                cand.insert(cand.begin() + static_cast<std::ptrdiff_t>(to), v);
-            }
-
-            size_t placed_now = 0;
-            double util_now = 0.0;
-            std::vector<std::vector<TransformedShape>> layout_now;
-            eval_order(cand, &layout_now, placed_now, util_now);
-            if (better(placed_now, util_now, best_placed, best_u)) {
-                order = std::move(cand);
-                best_placed = placed_now;
-                best_u = util_now;
-                best_l = std::move(layout_now);
-            }
-        }
-    };
-
-    for (size_t attempt = 0; attempt < params_.scheduling_attempts; ++attempt) {
-        if (should_stop(requestQuit)) break;
-
-        candidate_order.clear();
-        if (attempt == 0) {
-            candidate_order = smart_order_parts();
-        } else if (attempt == 1) {
-            candidate_order.resize(layout_.poly_num);
-            std::iota(candidate_order.begin(), candidate_order.end(), 0);
-            std::sort(candidate_order.begin(), candidate_order.end(), [&](size_t i, size_t j) {
-                return shape_area(i) > shape_area(j);
-            });
-        } else if (attempt == 2) {
-            build_group_order(false, false, true);
-        } else if (attempt == 3) {
-            build_group_order(true, false, true);
-        } else if (attempt == 4) {
-            build_group_order(true, true, false);
-        } else if (params_.use_random_shuffle) {
-            if (attempt % 2 == 0) {
-                build_group_order(true, true, true);
-            } else {
-                candidate_order = smart_order_parts();
-                std::shuffle(candidate_order.begin(), candidate_order.end(), gen);
-            }
-        } else {
-            continue;
-        }
-
-        size_t placed_now = 0;
-        double util_now = 0.0;
-        std::vector<std::vector<TransformedShape>> layout_now;
-        eval_order(candidate_order, &layout_now, placed_now, util_now);
-
-        ils_improve(candidate_order, placed_now, util_now, layout_now);
-
-        if (better(placed_now, util_now, best_placed_count, best_util)) {
-            best_placed_count = placed_now;
-            best_util = util_now;
+        // 评估
+        size_t current_placed = placed_indices.size();
+        if (current_placed > best_placed_count) {
+            best_placed_count = current_placed;
+            best_util = calculate_utilization();
             best_order = candidate_order;
-            best_layout = layout_now;
+            best_layout = layout_.sheet_parts;
             has_best_layout = true;
+        } else if (current_placed == best_placed_count) {
+            double current_util = calculate_utilization();
+            if (current_util > best_util) {
+                best_util = current_util;
+                best_order = candidate_order;
+                best_layout = layout_.sheet_parts;
+                has_best_layout = true;
+            }
         }
     }
 
@@ -3155,7 +2983,7 @@ double CircleNesting::binary_search_diameter(double min_diameter, double max_dia
     const size_t max_iterations = 50;
     
     for (size_t iter = 0; iter < max_iterations; ++iter) {
-        if (should_stop(requestQuit)) {
+        if (requestQuit && *requestQuit) {
             break;
         }
         
@@ -3419,7 +3247,7 @@ bool CircleNesting::generate_hodograph_initial_solution(double diameter, volatil
         shape_infos.reserve(layout_.poly_num);
 
         for (size_t i = 0; i < layout_.poly_num; ++i) {
-            if (should_stop(requestQuit)) {
+            if (requestQuit && *requestQuit) {
                 return false;
             }
 
@@ -3475,7 +3303,7 @@ bool CircleNesting::generate_hodograph_initial_solution(double diameter, volatil
         double radius_step = radius * 0.3 / shape_infos.size();
 
         for (size_t i = 0; i < shape_infos.size(); ++i) {
-            if (should_stop(requestQuit)) {
+            if (requestQuit && *requestQuit) {
                 return !placed_indices.empty();
             }
 
